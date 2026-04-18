@@ -1,6 +1,26 @@
-# 从零构建 Code Agent：TypeScript 实战教程
+# 从零构建 Code Agent：与当前 `ts-openai-agent` 实现对齐的教程
 
-> 本教程带你一步步构建一个类似 Claude Code 的终端 AI 编程助手。使用 TypeScript + OpenAI API + Ink（React CLI 框架）实现。
+> 这份教程基于当前仓库代码更新，不再引用已经删除的 demo 文件。本文统一以 `src/index.tsx`、`src/agent.ts`、`src/tools.ts`、`src/task-manager.ts`、`src/message-bus.ts`、`src/teammate-manager.ts`、`src/mcp-*.ts` 为准。
+
+---
+
+## 当前实现总览
+
+| 主题 | 状态 | 核心文件 | 说明 |
+|------|------|----------|------|
+| s01 Agent 循环 | 已实现 | `src/agent.ts` | 同时支持 Responses API 和 Chat Completions API |
+| s02 工具 | 已实现 | `src/tools.ts` | 基础工具、任务工具、技能工具、团队工具、MCP 入口 |
+| s03 TodoWrite | 已演进 | `src/task-manager.ts` | 当前不是临时 todo，而是持久化任务板 |
+| s04 子 Agent | 已实现 | `src/agent.ts` | `task` 工具派生一次性子代理 |
+| s05 技能 | 已实现 | `src/skills.ts` | 全局技能 + 仓库本地技能 |
+| s06 上下文压缩 | 已实现 | `src/compact.ts`、`src/agent.ts` | Chat 模式摘要压缩，Responses 模式重置上下文链 |
+| s07 任务系统 | 已实现 | `src/task-manager.ts` | 文件持久化、依赖关系、自动解阻塞 |
+| s08 后台任务 | 部分实现 | `src/teammate-manager.ts` | 目前没有通用后台作业系统，最接近的是常驻 teammate |
+| s09 Agent 团队 | 已实现 | `src/message-bus.ts`、`src/teammate-manager.ts` | `lead` + 多个常驻 teammate |
+| s10 团队协议 | 已实现 | `src/message-bus.ts`、`src/agent.ts` | 基于 inbox 的异步消息协议 |
+| s11 自主 Agent | 部分实现 | `src/agent.ts`、`src/index.tsx` | 能自主用工具，但没有长期调度器 |
+| s12 Worktree + 任务隔离 | 未实现 | - | 当前仍共享同一个工作目录 |
+| s13 MCP 集成 | 已实现 | `src/config.ts`、`src/mcp-runtime.ts`、`src/mcp-manager.ts` | MCP tool 动态暴露，resource/prompt 走 `mcp_call` |
 
 ---
 
@@ -11,26 +31,25 @@
 - [s02 工具](#s02-工具)
 
 ### 🟢 规划与协调
-- [s03 TodoWrite](#s03-todowrite)（待实现）
-- [s04 子 Agent](#s04-子-agent)（待实现）
-- [s05 技能](#s05-技能)（待实现）
-- [s07 任务系统](#s07-任务系统)（待实现）
+- [s03 TodoWrite](#s03-todowrite)
+- [s04 子 Agent](#s04-子-agent)
+- [s05 技能](#s05-技能)
+- [s07 任务系统](#s07-任务系统)
 
 ### 🟣 内存管理
-- [s06 上下文压缩](#s06-上下文压缩)（待实现）
+- [s06 上下文压缩](#s06-上下文压缩)
 
 ### 🟠 并发
-- [s08 后台任务](#s08-后台任务)（待实现）
+- [s08 后台任务](#s08-后台任务)
 
 ### 🔴 协作
-- [s09 Agent 团队](#s09-agent-团队)（待实现）
-- [s10 团队协议](#s10-团队协议)（待实现）
-- [s11 自主 Agent](#s11-自主-agent)（待实现）
-- [s12 Worktree + 任务隔离](#s12-worktree--任务隔离)（待实现）
+- [s09 Agent 团队](#s09-agent-团队)
+- [s10 团队协议](#s10-团队协议)
+- [s11 自主 Agent](#s11-自主-agent)
+- [s12 Worktree + 任务隔离](#s12-worktree--任务隔离)
 
----
-
-## 🔵 工具与执行
+### ⚙️ 扩展
+- [s13 MCP 集成](#s13-mcp-集成)
 
 ---
 
@@ -38,252 +57,135 @@
 
 ### 核心概念
 
-Agent 循环是整个 Code Agent 的心脏。它的本质是一个 **"思考-行动"循环**：
+当前项目的 Agent 循环已经不是早期教程里的单文件示例，而是拆成了三层：
 
-```
-用户输入 → LLM 思考 → 调用工具 → 拿到结果 → LLM 继续思考 → ... → 最终回复
-```
+1. `src/index.tsx`
+   负责 CLI、模型选择、命令处理、UI 渲染、`UiBridge`
+2. `src/agent.ts`
+   负责真正的推理循环、工具调用、上下文压缩、中断恢复
+3. `src/tools.ts`
+   负责工具定义和 handler 路由
 
-与普通的 ChatBot 不同，Agent 不是一问一答，而是 **自主决定** 是否需要调用工具、调用哪个工具、调用几次，直到它认为任务完成。
+主链路可以概括成：
 
-### 架构设计
-
-本项目支持两种 OpenAI API 模式：
-
-| 模式 | API | 适用场景 |
-|------|-----|---------|
-| `responses` | OpenAI Responses API | 原生 OpenAI（默认） |
-| `chat-completions` | Chat Completions API | DeepSeek 等兼容端点 |
-
-模式通过 `resolveApiMode()` 自动检测：
-
-```typescript
-// src/agent-tool-use-01-app.tsx:151
-function resolveApiMode(): "responses" | "chat-completions" {
-  const explicitMode = (process.env.OPENAI_API_MODE ?? "").trim().toLowerCase();
-  if (["chat", "chat-completions", "chat_completions"].includes(explicitMode)) {
-    return "chat-completions";
-  }
-  if (explicitMode === "responses") {
-    return "responses";
-  }
-  // DeepSeek 等端点自动走 chat-completions
-  const baseURL = (process.env.OPENAI_BASE_URL ?? "").toLowerCase();
-  if (baseURL.includes("deepseek.com")) {
-    return "chat-completions";
-  }
-  return "responses";
-}
+```text
+用户输入
+  -> runAgentTurn()
+  -> prepareToolRuntime()
+  -> runTurn()
+  -> Responses / Chat Completions 循环
+  -> 工具调用
+  -> 工具结果回填
+  -> 最终回复
 ```
 
-### 实现步骤
+### 当前状态对象
 
-#### 第 1 步：定义 Agent 状态
+主 agent 的运行状态定义在 `src/types.ts`：
 
-Agent 需要在多轮对话间维持状态：
-
-```typescript
-// src/agent-tool-use-01-app.tsx:35
-type AgentState = {
-  previousResponseId?: string;  // Responses API 的会话链
-  chatHistory: ChatMessage[];    // Chat Completions 的消息历史
-  turnCount: number;             // 对话轮数
-  launchedAt: number;            // 启动时间
+```ts
+export type AgentState = {
+  previousResponseId?: string;
+  chatHistory: ChatMessage[];
+  turnCount: number;
+  launchedAt: number;
+  roundsSinceTask: number;
+  compactCount: number;
 };
 ```
 
-两种 API 的状态管理策略不同：
-- **Responses API**：通过 `previousResponseId` 链式关联，服务端保存上下文
-- **Chat Completions**：客户端自己维护完整的 `chatHistory`
+这比旧教程多了两个重要字段：
 
-#### 第 2 步：实现 Agent 循环（Responses API）
+- `roundsSinceTask`
+  用来判断任务系统是否长时间没有更新
+- `compactCount`
+  用来统计上下文压缩次数
 
-这是核心循环，注意 `while (true)` —— 它会持续运行直到 LLM 不再请求工具调用：
+teammate 也有自己的状态对象，结构基本一致，但额外带 `name` 和 `role`。
 
-```typescript
-// src/agent-tool-use-01-app.tsx:374
-async function agentLoop(
-  query: string,
-  previousResponseId: string | undefined,
-  bridge: UiBridge,
-): Promise<string | undefined> {
-  // 第一轮输入是用户消息
-  let nextInput: ResponseInputItem[] | string = [
-    { role: "user", content: [{ type: "input_text", text: query }] },
-  ];
-  let currentResponseId = previousResponseId;
+### 两种 API 模式
 
-  while (true) {
-    // 1. 调用 LLM，流式输出
-    const response = await streamResponse(nextInput, currentResponseId, bridge);
-    currentResponseId = response.id;
+`src/config.ts` 中的 `resolveApiMode()` 会在两种模式之间切换：
 
-    // 2. 检查是否有工具调用
-    const toolCalls = Array.isArray(response.output)
-      ? response.output.filter((item: any) => item.type === "function_call")
-      : [];
+- `responses`
+- `chat-completions`
 
-    // 3. 没有工具调用 → 循环结束，返回最终回复
-    if (toolCalls.length === 0) {
-      return currentResponseId;
-    }
+规则是：
 
-    // 4. 有工具调用 → 执行工具，把结果作为下一轮输入
-    const results: ResponseInputItem[] = [];
-    for (const toolCall of toolCalls) {
-      results.push(await runToolCall(toolCall, bridge));
-    }
-    nextInput = results;
-  }
-}
-```
+- 显式配置 `apiMode`
+  优先采用配置值
+- 如果 `baseURL` 包含 `deepseek.com`
+  自动退到 `chat-completions`
+- 其他情况默认 `responses`
 
-**关键设计点：**
-- 循环终止条件：LLM 返回的 output 中没有 `function_call` 类型的项
-- 工具结果通过 `function_call_output` 类型反馈给 LLM
-- `previousResponseId` 让 API 服务端知道上下文链
+### Agent 入口
 
-#### 第 3 步：实现 Agent 循环（Chat Completions API）
+真实入口在 `src/agent.ts`：
 
-Chat Completions 模式下，客户端需要自己管理消息历史：
-
-```typescript
-// src/agent-tool-use-01-app.tsx:408
-async function agentLoopWithChatCompletions(
-  history: ChatMessage[],
-  bridge: UiBridge,
-): Promise<void> {
-  while (true) {
-    // 1. 发送完整历史给 LLM
-    const completion = await createChatCompletion(history);
-    const message = completion.choices?.[0]?.message;
-
-    // 2. 处理文本回复
-    const assistantText = extractAssistantText(message.content);
-    if (assistantText.trim()) {
-      bridge.pushAssistant(assistantText.trim());
-    }
-
-    // 3. 把 assistant 消息加入历史
-    history.push({
-      role: "assistant",
-      content: message.content ?? "",
-      tool_calls: message.tool_calls ?? undefined,
-    });
-
-    // 4. 检查工具调用
-    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-    if (toolCalls.length === 0) return;
-
-    // 5. 执行工具，结果加入历史
-    for (const toolCall of toolCalls) {
-      const name = String(toolCall.function?.name ?? "unknown_tool");
-      const args = safeJsonParse(String(toolCall.function?.arguments ?? "{}"));
-      const handler = TOOL_HANDLERS[name];
-      const outputText = handler ? await handler(args) : `Unknown tool: ${name}`;
-      bridge.pushTool(name, args, outputText);
-
-      history.push({
-        role: "tool",
-        tool_call_id: toolCall.id,
-        content: outputText,
-      });
-    }
-  }
-}
-```
-
-#### 第 4 步：统一入口
-
-`runAgentTurn` 统一了两种 API 模式的入口：
-
-```typescript
-// src/agent-tool-use-01-app.tsx:449
-async function runAgentTurn(
+```ts
+export async function runAgentTurn(
+  config: AgentConfig,
   query: string,
   state: AgentState,
   bridge: UiBridge,
+  control?: RunControl,
 ): Promise<void> {
-  state.turnCount += 1;
-  if (API_MODE === "chat-completions") {
-    state.chatHistory.push({ role: "user", content: query });
-    await agentLoopWithChatCompletions(state.chatHistory, bridge);
-    return;
-  }
-  state.previousResponseId = await agentLoop(query, state.previousResponseId, bridge);
+  const runtime = await prepareToolRuntime(buildLeadHandlers(config, bridge), TOOLS, CHAT_TOOLS);
+  await runTurn(config, query, state, bridge, runtime.handlers, runtime.responseTools, runtime.chatTools, control);
 }
 ```
 
-#### 第 5 步：流式输出
+这里和旧教程最大的区别是 `prepareToolRuntime()`。
 
-流式输出让用户实时看到 LLM 的思考过程：
+它不只返回静态工具，还会把 MCP server 暴露出来的动态 tool 面拼进去，所以每一轮真正看到的工具面是：
 
-```typescript
-// src/agent-tool-use-01-app.tsx:315
-async function streamResponse(
-  inputItems: ResponseInputItem[] | string,
-  previousResponseId: string | undefined,
-  bridge: UiBridge,
-): Promise<any> {
-  const stream = client.responses.stream({
-    model: MODEL,
-    instructions: SYSTEM,
-    input: inputItems as any,
-    previous_response_id: previousResponseId,
-    tools: TOOLS as any,
-  });
+- 基础工具
+- 任务工具
+- 技能工具
+- 团队工具
+- 动态 MCP tool
 
-  for await (const event of stream as AsyncIterable<any>) {
-    // 文本 delta → 实时显示
-    if (event.type === "response.output_text.delta") {
-      bridge.appendAssistantDelta(String(event.delta ?? ""));
-      continue;
-    }
-    // 思考过程 delta（可选显示）
-    if (SHOW_THINKING && ["response.reasoning_summary_text.delta",
-        "response.reasoning_text.delta"].includes(event.type)) {
-      bridge.appendThinkingDelta(String(event.delta ?? ""));
-      continue;
-    }
-    // 工具调用开始 → 结束当前文本流
-    if (event.type === "response.output_item.added" && event.item?.type === "function_call") {
-      bridge.finalizeStreaming();
-    }
-  }
+### `runTurn()` 的分支
 
-  const response = await stream.finalResponse();
-  bridge.finalizeStreaming();
-  return response;
-}
+`runTurn()` 按 API 模式分成两条路径：
+
+#### 1. `chat-completions`
+
+- 清理旧 assistant 消息中的 `reasoning_content`
+- 对 `chatHistory` 做 `microCompact`
+- 超过阈值时触发 `autoCompact`
+- 把用户消息加入 `chatHistory`
+- 进入 `agentLoopWithChatCompletions()`
+
+#### 2. `responses`
+
+- 每 20 轮重置一次 `previousResponseId`
+- 进入 `agentLoop()`
+- 服务端通过 `previous_response_id` 维持上下文链
+
+### 循环终止条件
+
+两种模式的终止条件都一样：
+
+- 模型不再返回 tool call
+- 当前回合结束
+
+也就是说，真正的 agent loop 不是“一问一答”，而是：
+
+```text
+用户问题 -> 模型 -> 工具 -> 模型 -> 工具 -> ... -> 最终回复
 ```
 
-### Agent 循环流程图
+### 中断恢复
 
-```
-┌─────────────┐
-│  用户输入    │
-└──────┬──────┘
-       ▼
-┌──────────────┐
-│  调用 LLM    │◄──────────────┐
-│  (流式输出)   │               │
-└──────┬───────┘               │
-       ▼                       │
-┌──────────────┐               │
-│ 有工具调用？  │               │
-└──┬────┬──────┘               │
-   │    │                      │
-  Yes   No                     │
-   │    │                      │
-   ▼    ▼                      │
-┌────┐ ┌──────────┐            │
-│执行│ │ 返回最终  │            │
-│工具│ │ 回复      │            │
-└──┬─┘ └──────────┘            │
-   │                           │
-   │  工具结果作为下轮输入       │
-   └───────────────────────────┘
-```
+当前代码专门处理了 CLI 中断：
+
+- `Esc` 会触发 `AbortController`
+- `streamResponse()` / `streamChatCompletion()` 会抛出 `TurnInterruptedError`
+- Chat 模式下会用 `repairInterruptedToolCallHistory()` 修复半截 tool call 历史
+- Responses 模式下会尽量保住 `responseId`
+
+这让“停止当前回合但保留会话”成为一个正式能力，而不是 UI 层强行打断。
 
 ---
 
@@ -291,358 +193,802 @@ async function streamResponse(
 
 ### 核心概念
 
-工具（Tools）是 Agent 与外部世界交互的桥梁。没有工具，LLM 只能"说"；有了工具，它能"做"。
+当前仓库不是只有四个最小工具，而是把工具按权限拆成三层：
 
-一个 Code Agent 最基本的工具集是：
-1. **bash** — 执行 shell 命令
-2. **read_file** — 读取文件
-3. **write_file** — 写入文件
-4. **edit_file** — 编辑文件（精确替换）
+1. `BASE_TOOLS`
+   所有 agent 都可见
+2. `TOOLS`
+   主 agent 的完整工具面
+3. `TEAMMATE_TOOLS`
+   teammate 可见的受限工具面
 
-### 实现步骤
+### 基础工具
 
-#### 第 1 步：定义工具 Schema
+`src/tools.ts` 中的 `BASE_TOOLS` 目前包含：
 
-工具需要以 JSON Schema 格式描述，让 LLM 知道有哪些工具可用、参数是什么：
+- `bash`
+- `read_file`
+- `write_file`
+- `edit_file`
+- `task_create`
+- `task_update`
+- `task_list`
+- `task_get`
+- `mcp_call`
+- `load_skill`
 
-```typescript
-// src/agent-tool-use-01-app.tsx:72
-const TOOLS = [
-  {
-    type: "function",
-    name: "bash",
-    description: "Run a shell command.",
-    parameters: {
-      type: "object",
-      properties: {
-        command: { type: "string" },
-      },
-      required: ["command"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "read_file",
-    description: "Read file contents.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string" },
-        limit: { type: "integer" },  // 可选：限制读取行数
-      },
-      required: ["path"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "write_file",
-    description: "Write content to file.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string" },
-        content: { type: "string" },
-      },
-      required: ["path", "content"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "edit_file",
-    description: "Replace exact text in file.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string" },
-        old_text: { type: "string" },
-        new_text: { type: "string" },
-      },
-      required: ["path", "old_text", "new_text"],
-      additionalProperties: false,
-    },
-  },
-] as const;
-```
+这比旧教程多出三类能力：
 
-**设计要点：**
-- `additionalProperties: false` 阻止 LLM 传入未定义的参数
-- `description` 要简洁明确，LLM 靠它决定何时使用哪个工具
-- `required` 明确必填参数
+- 持久化任务管理
+- 技能系统
+- MCP 资源 / prompt 访问
 
-#### 第 2 步：工具分发器
+### 主 agent 独有工具
 
-用一个 map 将工具名映射到执行函数：
+主 agent 额外拥有：
 
-```typescript
-// src/agent-tool-use-01-app.tsx:140
-const TOOL_HANDLERS: Record<string, (args: ToolArgs) => Promise<string> | string> = {
-  bash:       ({ command }) => runBash(String(command)),
-  read_file:  ({ path: filePath, limit }) => runRead(String(filePath), toOptionalNumber(limit)),
+- `task`
+  派生一次性子 Agent
+- `message_send`
+  给 `lead` 或 teammate 发消息
+- `teammate_spawn`
+- `teammate_list`
+- `teammate_shutdown`
+- `lead_inbox`
+
+teammate 不允许再派生子 Agent，也不能再扩展团队，只保留：
+
+- `BASE_TOOLS`
+- `message_send`
+
+这样做是为了避免无限递归扩张。
+
+### 工具 handler 路由
+
+工具分发表定义在 `BASE_TOOL_HANDLERS`：
+
+```ts
+export const BASE_TOOL_HANDLERS = {
+  bash: ({ command }, control) => runBash(String(command), control?.signal),
+  read_file: ({ path: filePath, limit }) => runRead(String(filePath), toOptionalNumber(limit)),
   write_file: ({ path: filePath, content }) => runWrite(String(filePath), String(content)),
-  edit_file:  ({ path: filePath, old_text, new_text }) =>
-                runEdit(String(filePath), String(old_text), String(new_text)),
+  edit_file: ({ path: filePath, old_text, new_text }) => runEdit(String(filePath), String(old_text), String(new_text)),
+  mcp_call: (args) => handleMcpCall(args),
+  task_create: ({ subject, description }) => taskManager.create(String(subject), toOptionalString(description)),
+  task_update: ({ task_id, status, blocked_by, blocks }) => taskManager.update(Number(task_id), toOptionalString(status), blocked_by as number[] | undefined, blocks as number[] | undefined),
+  task_list: () => taskManager.list(),
+  task_get: ({ task_id }) => taskManager.get(Number(task_id)),
+  load_skill: ({ name }) => skillLoader.getContent(String(name)),
+  teammate_list: () => teammateManager.formatTeamStatus(),
+  lead_inbox: ({ drain }) => formatMailboxMessages(drain ? messageBus.drainInbox(LEAD_NAME) : messageBus.readInbox(LEAD_NAME)),
 };
 ```
 
-工具调用的处理流程：
+设计原则仍然延续了旧教程的思路：
 
-```typescript
-// src/agent-tool-use-01-app.tsx:358
-async function runToolCall(toolCall: any, bridge: UiBridge): Promise<ResponseInputItem> {
-  const name = String(toolCall.name ?? toolCall.function?.name ?? "unknown_tool");
-  const rawArgs = String(toolCall.arguments ?? toolCall.function?.arguments ?? "{}");
-  const args = safeJsonParse(rawArgs);
+- 工具统一返回字符串
+- 错误尽量转成文本而不是抛异常
+- 输出有长度上限
+- 文件读写受工作区沙箱约束
 
-  const handler = TOOL_HANDLERS[name];
-  const outputText = handler ? await handler(args) : `Unknown tool: ${name}`;
-  bridge.pushTool(name, args, outputText);
+### 安全边界
 
-  return {
-    type: "function_call_output",
-    call_id: toolCall.call_id,
-    output: outputText,
-  };
-}
-```
+`bash` 和文件工具仍然保留了最基本的保护：
 
-#### 第 3 步：实现 bash 工具
+- `safePath()` 阻止路径逃逸
+- 危险命令片段黑名单
+- `timeout: 120_000`
+- 输出截断到 50K 字符
 
-bash 是最强大也最危险的工具，需要安全防护：
+### Chat 模式工具格式
 
-```typescript
-// src/agent-tool-use-01-app.tsx:202
-async function runBash(command: string): Promise<string> {
-  // 安全检查：阻止危险命令
-  const dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
-  if (dangerous.some((snippet) => command.includes(snippet))) {
-    return "Error: Dangerous command blocked";
-  }
+Responses API 和 Chat Completions API 的 tool schema 不同，所以当前代码会把内部工具定义转换成：
 
-  try {
-    const { stdout, stderr } = await execAsync(command, {
-      cwd: WORKDIR,            // 在工作目录执行
-      timeout: 120_000,         // 120 秒超时
-      maxBuffer: 1024 * 1024 * 10,  // 10MB 输出缓冲
-      shell: process.env.SHELL, // 使用用户的 shell
-    });
-    const combined = `${stdout}${stderr}`.trim();
-    return combined ? combined.slice(0, 50_000) : "(no output)";
-  } catch (error) {
-    if (isExecTimeout(error)) {
-      return "Error: Timeout (120s)";
-    }
-    const execError = toExecError(error);
-    const combined = `${execError.stdout ?? ""}${execError.stderr ?? ""}`.trim();
-    return combined ? combined.slice(0, 50_000) : `Error: ${String(error)}`;
-  }
-}
-```
+- `TOOLS`
+  给 Responses API
+- `CHAT_TOOLS`
+  给 Chat Completions API
 
-**安全设计：**
-- 危险命令黑名单
-- 执行超时保护（120秒）
-- 输出大小限制（50K 字符）
-- 错误也返回文本而非抛异常（让 Agent 能自行处理错误）
+### 动态 MCP tool
 
-#### 第 4 步：实现文件操作工具
+这是当前代码和旧教程最大的结构变化之一。
 
-**路径安全**——所有文件操作都必须通过 `safePath` 防止路径逃逸：
+MCP 远端 `tool` 不再只通过一个固定入口调用，而是会在运行时动态展开成普通 function tool。当前策略是：
 
-```typescript
-// src/agent-tool-use-01-app.tsx:193
-function safePath(relativePath: string): string {
-  const resolved = path.resolve(WORKDIR, relativePath);
-  const relative = path.relative(WORKDIR, resolved);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error(`Path escapes workspace: ${relativePath}`);
-  }
-  return resolved;
-}
-```
+- MCP `tool`
+  动态暴露为常规 tool
+- MCP `resource` / `prompt`
+  仍通过 `mcp_call` 使用
 
-**read_file** — 支持行数限制：
+这样模型能像调用本地工具一样直接调用远端 MCP tool，同时又不会把 resource / prompt 混进同一套 schema。
 
-```typescript
-// src/agent-tool-use-01-app.tsx:239
-function runRead(filePath: string, limit?: number): string {
-  try {
-    const text = fs.readFileSync(safePath(filePath), "utf8");
-    let lines = text.split(/\r?\n/);
-    if (limit && limit < lines.length) {
-      lines = [...lines.slice(0, limit), `... (${lines.length - limit} more lines)`];
-    }
-    return lines.join("\n").slice(0, 50_000);
-  } catch (error) {
-    return `Error: ${error instanceof Error ? error.message : String(error)}`;
-  }
-}
-```
+### 终端 UI
 
-**write_file** — 自动创建目录：
+教程里不能忽略 `src/index.tsx`，因为这个项目已经是一个完整 CLI，而不是无头 agent。
 
-```typescript
-// src/agent-tool-use-01-app.tsx:252
-function runWrite(filePath: string, content: string): string {
-  try {
-    const fullPath = safePath(filePath);
-    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-    fs.writeFileSync(fullPath, content, "utf8");
-    return `Wrote ${Buffer.byteLength(content, "utf8")} bytes to ${filePath}`;
-  } catch (error) {
-    return `Error: ${error instanceof Error ? error.message : String(error)}`;
-  }
-}
-```
+`UiBridge` 仍然是模型层和 UI 层之间的桥：
 
-**edit_file** — 精确文本替换（而非行号替换）：
-
-```typescript
-// src/agent-tool-use-01-app.tsx:263
-function runEdit(filePath: string, oldText: string, newText: string): string {
-  try {
-    const fullPath = safePath(filePath);
-    const content = fs.readFileSync(fullPath, "utf8");
-    if (!content.includes(oldText)) {
-      return `Error: Text not found in ${filePath}`;
-    }
-    fs.writeFileSync(fullPath, content.replace(oldText, newText), "utf8");
-    return `Edited ${filePath}`;
-  } catch (error) {
-    return `Error: ${error instanceof Error ? error.message : String(error)}`;
-  }
-}
-```
-
-**为什么用文本匹配而非行号？** 因为 LLM 计算行号经常出错，而精确文本匹配更可靠。这也是 Claude Code 的设计思路。
-
-### 工具设计原则总结
-
-| 原则 | 说明 |
-|------|------|
-| **返回字符串** | 所有工具统一返回字符串，LLM 容易理解 |
-| **错误不抛异常** | 返回 `Error: ...` 字符串，让 Agent 自行决定如何处理 |
-| **输出截断** | 防止超长输出撑爆上下文窗口（50K 字符限制） |
-| **路径沙箱** | `safePath` 确保文件操作不逃出工作目录 |
-| **命令黑名单** | 阻止明显的破坏性 shell 命令 |
-| **超时保护** | 防止命令挂起导致 Agent 卡死 |
-
-### 终端 UI（附加知识）
-
-本项目使用 **Ink**（React for CLI）构建终端界面，提供了类似 Claude Code 的交互体验：
-
-- 信任确认提示（TrustPrompt）
-- 流式文本输出
-- 工具调用可视化（名称、参数、结果）
-- 斜杠命令菜单（`/help`、`/status`、`/clear`、`/exit`）
-- 自适应终端尺寸
-
-UiBridge 是 Agent 循环与 UI 层的桥梁：
-
-```typescript
-type UiBridge = {
-  appendAssistantDelta(delta: string): void;   // 流式追加文本
-  appendThinkingDelta(delta: string): void;    // 流式追加思考过程
-  finalizeStreaming(): void;                    // 结束当前流式消息
-  pushAssistant(text: string): void;           // 推送完整助手消息
-  pushTool(name: string, args: ToolArgs, result: string): void;  // 推送工具调用记录
+```ts
+export type UiBridge = {
+  appendAssistantDelta(delta: string): void;
+  appendThinkingDelta(delta: string): void;
+  finalizeStreaming(): void;
+  pushAssistant(text: string): void;
+  pushTool(name: string, args: ToolArgs, result: string): void;
 };
 ```
 
----
+当前 CLI 还支持这些命令：
 
-## 🟢 规划与协调
+- `/help`
+- `/status`
+- `/mcp`
+- `/mcp refresh [name]`
+- `/team`
+- `/inbox`
+- `/provider`
+- `/model`
+- `/compact`
+- `/new`
+- `/exit`
 
 ---
 
 ## s03 TodoWrite
 
-> 待实现
+### 旧概念和当前实现的差别
 
-TodoWrite 是 Agent 的任务规划工具。它让 Agent 能够将复杂任务分解为可跟踪的步骤列表，并在执行过程中更新进度。类似 Claude Code 中的任务清单功能。
+旧教程把 TodoWrite 讲成“临时任务清单工具”。当前仓库没有单独的 `TodoWrite` 工具，而是直接把这个能力升级成了一个持久化任务系统。
+
+也就是说：
+
+- 不是把 todo 只留在上下文里
+- 而是把任务写入 `.tasks/`
+- 由 `TaskManager` 统一管理
+
+### 为什么这么做
+
+临时 todo 有两个问题：
+
+1. 会话一压缩，清单容易丢
+2. 多 agent 协作时难共享
+
+持久化任务板解决了这两个问题：
+
+- 任务存在文件里，不依赖当前上下文窗口
+- 主 agent 和 teammate 都能围绕同一组 task 协作
+
+### 当前任务数据结构
+
+`src/task-manager.ts` 中的任务结构是：
+
+```ts
+export interface Task {
+  id: number;
+  subject: string;
+  description: string;
+  status: "pending" | "in_progress" | "completed";
+  blockedBy: number[];
+  blocks: number[];
+}
+```
+
+这说明当前实现已经不只是 todo list，而是一个简化版 DAG。
+
+### 任务提醒机制
+
+`src/agent.ts` 里有一个实际运行中的提示逻辑：
+
+- 如果任务板里还有 active task
+- 且 agent 连续多轮没有更新任务状态
+- 系统会插入提醒：
+
+```text
+<reminder>Update your tasks with task_list or task_update.</reminder>
+```
+
+所以当前项目已经把“计划”从 prompt 习惯推进成了工具约束。
 
 ---
 
 ## s04 子 Agent
 
-> 待实现
+### 当前能力
 
-子 Agent（Sub-Agent）允许主 Agent 派生子任务给独立的 Agent 实例处理。每个子 Agent 有自己的上下文窗口和工具集，适合处理需要深入探索但不应污染主上下文的任务。
+子 Agent 已经实现，对应工具名就是 `task`。
+
+它的语义不是“开线程”，而是：
+
+- 给一个清晰的子任务描述
+- 派生一个干净上下文
+- 让子 agent 独立完成
+- 最终只把摘要结果返回主 agent
+
+### 工具定义
+
+`src/tools.ts` 中的定义：
+
+```ts
+export const TASK_TOOL = {
+  type: "function",
+  name: "task",
+  description:
+    "Dispatch a subtask to an independent sub-agent with a clean context. The sub-agent has all base tools but cannot spawn further sub-agents.",
+  parameters: {
+    type: "object",
+    properties: {
+      description: { type: "string" },
+    },
+    required: ["description"],
+    additionalProperties: false,
+  },
+} as const;
+```
+
+### 当前实现细节
+
+`src/agent.ts` 中分别实现了：
+
+- `subAgentLoopResponses()`
+- `subAgentLoopChatCompletions()`
+
+共同点：
+
+- 最多跑 `MAX_SUBAGENT_ROUNDS = 30`
+- 只使用 `BASE_TOOLS`
+- 不允许继续 `task`
+- 不允许创建 teammate
+- 返回最后一次文本输出作为摘要
+
+### 什么时候适合用
+
+`task` 适合这些场景：
+
+- 需要隔离上下文污染的探索任务
+- 需要一次性深挖某个文件或模块
+- 主 agent 想保持当前主线对话干净
+
+不适合的场景：
+
+- 需要持续协作
+- 需要长期身份
+- 需要异步收件箱
+
+这些应该交给 Agent Teams。
 
 ---
 
 ## s05 技能
 
-> 待实现
+### 核心概念
 
-技能（Skills）是预定义的 prompt 模板和工作流，Agent 可以在特定场景下调用。类似 Claude Code 的 Skill 系统，可以为特定任务领域提供专业化的指导。
+技能系统已经实现，而且直接参与 system prompt 构建。
+
+入口在 `src/skills.ts` 和 `src/index.tsx`。
+
+### 加载顺序
+
+技能来源有两层：
+
+1. 全局技能目录
+   `~/.claude/skills`
+2. 当前仓库本地技能目录
+   `./skills`
+
+后加载的本地技能会覆盖同名全局技能。
+
+### `SkillLoader` 的职责
+
+`SkillLoader` 会：
+
+- 扫描目录
+- 查找每个技能目录下的 `SKILL.md`
+- 解析 frontmatter
+- 记录 `name`、`description`、`tags`
+- 返回技能描述列表和技能正文
+
+### 技能如何进入提示词
+
+`src/index.tsx` 中的 `buildSystemPrompt()` 会把技能描述拼进系统提示词：
+
+```ts
+function buildSystemPrompt(): string {
+  const SKILL_DESCRIPTIONS = skillLoader.getDescriptions();
+  const mcpSummary = getMcpPromptInstructions();
+  return `You are a coding agent at ${WORKDIR}. Use tools to solve tasks. Act, don't explain.
+Use load_skill to access specialized knowledge before tackling unfamiliar topics.
+
+Skills available:
+${SKILL_DESCRIPTIONS}
+
+${mcpSummary}`;
+}
+```
+
+也就是说，模型一开始只知道“有哪些技能”，真正需要时再调用 `load_skill` 读取正文。
+
+### 为什么这样设计
+
+这样可以减少首轮 prompt 体积：
+
+- 描述先进入系统提示词
+- 技能正文按需加载
+
+这是一个比“把所有技能全文都塞进 prompt”更实际的做法。
 
 ---
 
 ## s07 任务系统
 
-> 待实现
+### 核心概念
 
-任务系统在 TodoWrite 基础上进一步扩展，提供持久化的任务管理、状态追踪、依赖关系等功能。
+如果说 s03 讲的是“TodoWrite 如何演化”，那 s07 讲的是当前真正落地的任务系统。
 
----
+当前实现是一个文件持久化任务板：
 
-## 🟣 内存管理
+```text
+.tasks/
+  task_1.json
+  task_2.json
+  task_3.json
+```
+
+### 关键能力
+
+`TaskManager` 当前支持：
+
+- `create()`
+- `update()`
+- `list()`
+- `get()`
+
+### 依赖关系
+
+这个系统不是平铺的待办列表，而是支持：
+
+- `blockedBy`
+- `blocks`
+
+当一个任务完成时，`clearDependency()` 会自动把它从其他任务的 `blockedBy` 里移除。
+
+这意味着你已经拥有了一个最小可用的“任务依赖解除”机制。
+
+### 输出格式
+
+`list()` 的输出是面向模型和终端都容易消费的文本：
+
+```text
+[ ] #1: implement parser
+[>] #2: add tests (blocked by: 1)
+[x] #3: update docs
+```
+
+比直接返回 JSON 更适合模型在对话里快速理解任务板状态。
 
 ---
 
 ## s06 上下文压缩
 
-> 待实现
+### 当前实现不是单一路径
 
-当对话历史变得过长时，上下文压缩会自动摘要早期消息，保持窗口内信息密度。这对于长时间运行的 Agent 会话至关重要。
+压缩逻辑已经落地，但要分 API 模式理解：
 
----
+- `chat-completions`
+  真的维护本地历史，也真的会摘要压缩
+- `responses`
+  不维护完整本地历史，所谓 compact 更接近“重开上下文链”
 
-## 🟠 并发
+### 第 1 层：`microCompact()`
+
+`src/compact.ts` 中的 `microCompact()` 会：
+
+- 找出历史里的旧 `tool` 消息
+- 永远保留最近 3 条工具输出
+- 对更早且很长的 tool 输出替换成：
+
+```text
+[Previous: used <toolName>]
+```
+
+这一步不需要额外模型调用，成本很低。
+
+### 第 2 层：`autoCompact()`
+
+真正的摘要压缩也已经实现：
+
+1. 先把完整历史写入 `.transcripts/`
+2. 调用 `chat.completions.create()` 生成摘要
+3. 用两条新消息替换旧历史
+
+压缩后的历史只保留：
+
+- 一条压缩摘要
+- 一条 assistant 确认消息
+
+### 阈值
+
+当前阈值定义为：
+
+```ts
+const TOKEN_THRESHOLD = 50000;
+```
+
+估算方式是粗略的：
+
+```ts
+Math.ceil(JSON.stringify(messages).length / 4)
+```
+
+### Responses 模式的差异
+
+Responses 模式下，当前代码每 20 轮会执行：
+
+- `state.previousResponseId = undefined`
+- `state.compactCount += 1`
+
+它不会做本地摘要，所以更准确的说法是：
+
+- Chat 模式做“摘要压缩”
+- Responses 模式做“上下文链重置”
+
+### 手动命令
+
+CLI 里 `/compact` 已经接到同一套逻辑上：
+
+- Chat 模式
+  直接触发 `autoCompact()`
+- Responses 模式
+  直接清空 `previousResponseId`
 
 ---
 
 ## s08 后台任务
 
-> 待实现
+### 当前真实状态
 
-后台任务允许 Agent 将耗时操作（如构建、测试）放到后台执行，同时继续与用户交互。任务完成时通知用户。
+这个主题在旧教程里是“待实现”，而当前代码属于“部分实现”。
 
----
+已经有的部分：
 
-## 🔴 协作
+- teammate runtime 是常驻的
+- inbox 是异步的
+- `lead` 可以继续接收新消息
+
+还没有的部分：
+
+- 一个通用后台作业执行器
+- 类似 `job_start` / `job_poll` / `job_cancel` 的统一接口
+- bash 命令脱离当前回合独立运行的能力
+
+所以当前仓库还不能说“后台任务系统完整落地了”，只能说：
+
+- 有长期运行的 teammate
+- 但没有统一的后台 job 抽象
 
 ---
 
 ## s09 Agent 团队
 
-> 待实现
+### 当前已经实现
 
-多个 Agent 实例协同工作，每个 Agent 有不同的专长和角色（如代码审查专家、测试专家、架构师等）。
+这部分不再是设计文档，而是实际代码。
+
+团队系统的三个核心文件是：
+
+- `src/message-bus.ts`
+- `src/teammate-manager.ts`
+- `src/team-types.ts`
+
+### 基础结构
+
+当前团队目录是：
+
+```text
+.team/
+  config.json
+  inbox/
+    lead.jsonl
+    alice.jsonl
+    bob.jsonl
+```
+
+### `MessageBus`
+
+`MessageBus` 负责：
+
+- `send()`
+- `readInbox()`
+- `drainInbox()`
+- `inboxSize()`
+
+它采用 JSONL 收件箱，每条消息 append 一行。这样做的好处是：
+
+- 实现简单
+- 易于审计
+- 适合 agent 异步通信
+
+### `TeammateManager`
+
+`TeammateManager` 负责：
+
+- 成员注册
+- `.team/config.json` 读写
+- runtime 状态维护
+- idle / wake / stop
+- 团队状态展示
+
+成员状态包括：
+
+- `working`
+- `idle`
+- `stopped`
+- `error`
+
+### 当前可用团队工具
+
+当前主 agent 可以：
+
+- `teammate_spawn`
+- `teammate_list`
+- `teammate_shutdown`
+- `message_send`
+- `lead_inbox`
+
+这已经够支撑一个最小可用的多 agent CLI。
 
 ---
 
 ## s10 团队协议
 
-> 待实现
+### 邮件格式
 
-定义 Agent 之间的通信协议和协作规范，确保多 Agent 系统的有序运转。
+当前邮件类型定义在 `src/team-types.ts`：
+
+```ts
+export type MailboxMessageType =
+  | "message"
+  | "broadcast"
+  | "shutdown_request"
+  | "shutdown_response";
+```
+
+每条消息都包含：
+
+- `id`
+- `type`
+- `from`
+- `to`
+- `content`
+- `timestamp`
+
+### 收件箱注入方式
+
+`src/message-bus.ts` 里的 `renderInboxPrompt()` 会把收件箱消息包装成：
+
+```xml
+<inbox>
+[
+  {
+    "from": "lead",
+    "type": "message",
+    "content": "...",
+    "timestamp": "..."
+  }
+]
+</inbox>
+```
+
+然后 `launchTeammateRuntime()` 会把这段 inbox prompt 当成新的用户工作指令送进 teammate。
+
+### teammate 的系统约束
+
+`buildTeammateSystem()` 会给 teammate 增加明确规则：
+
+- 你是某个固定名字的 teammate
+- 你不能直接和用户说话
+- 你通过 `message_send` 协作
+- 完成有意义的阶段后，给 `lead` 发送简洁更新
+
+这很重要，因为团队系统能否稳定工作，不只靠工具，还靠角色边界清晰。
+
+### 协议的本质
+
+当前团队协议的核心不是 RPC，而是：
+
+- 持久身份
+- 异步消息
+- 独立上下文
+- 显式唤醒
+
+这和一次性 `task` 子 Agent 是两套不同的协作模型。
 
 ---
 
 ## s11 自主 Agent
 
-> 待实现
+### 当前已经具备的自主性
 
-自主 Agent 能够独立规划和执行复杂任务，无需持续的用户输入。包括目标分解、自我纠错、进度汇报等能力。
+当前项目已经具备“短周期自主执行”能力：
+
+- 模型自己决定何时调用工具
+- 自己决定是否创建 / 更新任务
+- 自己决定是否加载技能
+- 主 agent 可以自己派生子 Agent
+- 主 agent 可以自己创建 teammate 并发消息
+
+### 还没有的能力
+
+但它还不是一个“长期自治系统”，因为缺少这些部件：
+
+- 长期目标调度器
+- 定时或事件驱动的自动唤醒
+- 跨会话的高层计划恢复
+- 真正的后台作业系统
+- 工作目录级别的隔离执行
+
+所以更准确的描述是：
+
+- 这是一个会自主用工具的交互式 coding agent
+- 还不是一个无人值守的长期自治 agent 平台
+
+### 用户控制点
+
+当前用户仍然保留强控制权：
+
+- 信任确认提示
+- 模型 / provider 切换
+- `/compact`
+- `/new`
+- `Esc` 中断当前回合
 
 ---
 
 ## s12 Worktree + 任务隔离
 
-> 待实现
+### 当前状态
 
-利用 Git Worktree 为每个任务创建隔离的工作副本，避免并行任务之间的文件冲突。任务完成后将变更合并回主分支。
+这部分仍然没有落地。
+
+目前无论是：
+
+- 主 agent
+- 一次性 `task` 子 Agent
+- 常驻 teammate
+
+共享的都是同一个 `WORKDIR`。
+
+### 现有隔离手段
+
+虽然没有 git worktree，但当前代码已经有两层“软隔离”：
+
+1. 上下文隔离
+   `task` 子 Agent 使用独立历史
+2. 角色隔离
+   teammate 有独立 inbox 和独立状态
+
+### 还缺什么
+
+如果以后要实现真正的 worktree 隔离，至少需要补这几块：
+
+- 每个任务一个独立目录
+- teammate / sub-agent 绑定独立工作树
+- 变更合并策略
+- 冲突处理
+- 生命周期清理
+
+当前仓库还没有这些能力，所以文档里必须明确写成“未实现”。
+
+---
+
+## s13 MCP 集成
+
+### 这是当前仓库的新增主线
+
+旧教程没有 MCP，但当前代码已经把它接成一等公民。
+
+相关文件：
+
+- `src/config.ts`
+- `src/mcp-types.ts`
+- `src/mcp-client.ts`
+- `src/mcp-manager.ts`
+- `src/mcp-runtime.ts`
+
+### 配置入口
+
+MCP 配置现在走 `~/.codemini/settings.json`：
+
+```json
+{
+  "mcp": {
+    "servers": [
+      {
+        "name": "docs",
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem"]
+      }
+    ]
+  }
+}
+```
+
+`src/config.ts` 会负责：
+
+- 读取配置
+- 归一化字段
+- 过滤错误配置
+- 生成 warning
+
+### 运行时结构
+
+MCP 调用链是：
+
+```text
+LLM / Tool call
+  -> tools.ts
+  -> mcp-runtime.ts
+  -> mcp-manager.ts
+  -> mcp-client.ts
+  -> MCP server
+```
+
+### 当前支持什么
+
+当前实现支持三种 MCP 能力：
+
+- `tool`
+- `resource`
+- `prompt`
+
+说明：
+
+- MCP `tool`
+  会被动态暴露成常规 function tool
+- MCP `resource` / `prompt`
+  通过 `mcp_call` 访问
+
+### 初始化策略
+
+MCP 不是启动时一股脑阻塞初始化，而是：
+
+- `primeMcpRuntime()`
+  启动时后台预热
+- `ensureMcpInitialized()`
+  首次真正调用前确保初始化
+- `refreshMcpFromSettings()`
+  重新读取配置并刷新 server
+
+### CLI 支持
+
+当前 CLI 已经提供：
+
+- `/mcp`
+  查看所有 MCP server 状态
+- `/mcp refresh`
+  刷新所有 server
+- `/mcp refresh <name>`
+  刷新单个 server
+
+这说明 MCP 不只是库层集成，而是已经接进了真实终端工作流。
+
+---
+
+## 总结
+
+1. `src/index.tsx`
+   先看 CLI、系统提示词、命令处理、`UiBridge`
+2. `src/agent.ts`
+   再看主循环、子 Agent、teammate runtime、上下文压缩接入点
+3. `src/tools.ts`
+   再看工具定义、权限分层、handler 路由
+4. `src/task-manager.ts`
+   理解任务板
+5. `src/message-bus.ts` + `src/teammate-manager.ts`
+   理解 Agent Teams
+6. `src/mcp-runtime.ts` + `src/mcp-manager.ts`
+   理解 MCP
+
+一句话总结当前项目：
+
+> 这已经不是“一个带 bash 的对话 demo”，而是一个支持任务板、子 Agent、技能、上下文压缩、团队协作和 MCP 的终端 coding agent。

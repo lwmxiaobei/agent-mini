@@ -19,8 +19,10 @@ import { isTurnInterruptedError, runAgentTurn, type AgentConfig } from "./agent.
 import { resolveConfig, getProviderNames, getProviderModels, loadSettings, reloadSettings, getSettingsPath, normalizeModelEntry, type ResolvedConfig } from "./config.js";
 import { estimateTokens, autoCompact } from "./compact.js";
 import { formatMailboxMessages, renderInboxPrompt } from "./message-bus.js";
+import { ensureMcpInitialized, getMcpPromptInstructions, mcpManager, primeMcpRuntime, refreshMcpFromSettings } from "./mcp-runtime.js";
 import { skillLoader, messageBus, teammateManager } from "./tools.js";
 import type { AgentState, DiffLine, UiBridge, UiMessage } from "./types.js";
+import { ellipsize } from "./utils.js";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -30,11 +32,14 @@ const WORKDIR = process.cwd();
 
 function buildSystemPrompt(): string {
   const SKILL_DESCRIPTIONS = skillLoader.getDescriptions();
+  const mcpSummary = getMcpPromptInstructions();
   return `You are a coding agent at ${WORKDIR}. Use tools to solve tasks. Act, don't explain.
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
 
 Skills available:
-${SKILL_DESCRIPTIONS}`;
+${SKILL_DESCRIPTIONS}
+
+${mcpSummary}`;
 }
 
 function createAgentConfig(resolved: ResolvedConfig): AgentConfig {
@@ -58,6 +63,7 @@ let agentConfig: AgentConfig = undefined!;
 function ensureConfig(providerName?: string, modelName?: string): void {
   currentResolved = resolveConfig(providerName, modelName);
   agentConfig = createAgentConfig(currentResolved);
+  primeMcpRuntime();
 }
 
 // If MODEL_ID env var is set, initialize immediately (skip interactive selection)
@@ -115,6 +121,8 @@ type SlashCommand = {
 const SLASH_COMMANDS: SlashCommand[] = [
   { command: "/help", description: "show available commands" },
   { command: "/status", description: "show session status" },
+  { command: "/mcp", description: "show MCP server status" },
+  { command: "/mcp refresh", description: "refresh MCP caches and reconnect servers" },
   { command: "/team", description: "show teammate statuses" },
   { command: "/inbox", description: "drain lead inbox" },
   { command: "/provider", description: "switch provider" },
@@ -134,13 +142,6 @@ function formatDuration(ms: number): string {
     return `${remainingSeconds}s`;
   }
   return `${minutes}m${remainingSeconds}s`;
-}
-
-function ellipsize(text: string, maxLength: number): string {
-  if (text.length <= maxLength) {
-    return text;
-  }
-  return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
 function stripAnsi(text: string): string {
@@ -436,6 +437,7 @@ function helpMessage(): string {
   return [
     "help                show available commands",
     "status              show session status",
+    "mcp [refresh [name]] show MCP status or refresh all / one server",
     "team                show teammate statuses",
     "inbox               drain lead inbox",
     "provider [name]     switch provider (no arg = list providers)",
@@ -455,6 +457,7 @@ function helpMessage(): string {
 }
 
 function sessionStatus(state: AgentState): string {
+  const mcpSummary = mcpManager.getStatusSummary();
   const modelsLine = currentResolved.availableModels.length > 0
     ? `models   ${currentResolved.availableModels.join(", ")}`
     : "";
@@ -467,6 +470,7 @@ function sessionStatus(state: AgentState): string {
     `baseURL  ${currentResolved.baseURL}`,
     `turns    ${state.turnCount}`,
     `context  ~${estimateTokens(state.chatHistory)} tokens | compacted: ${state.compactCount} times`,
+    `mcp      ${mcpSummary.connected} connected | ${mcpSummary.degraded} degraded | ${mcpSummary.disconnected} disconnected | ${mcpSummary.enabled} enabled`,
     `team     ${teammateManager.listMembers().length} teammates | lead inbox: ${messageBus.inboxSize("lead")}`,
     `uptime   ${formatDuration(Date.now() - state.launchedAt)}`,
   ].filter(Boolean).join("\n");
@@ -503,6 +507,7 @@ function normalizeCommand(inputValue: string): string | null {
   switch (cmd) {
     case "help":
     case "status":
+    case "mcp":
     case "team":
     case "inbox":
     case "compact":
@@ -722,6 +727,7 @@ function CliApp() {
   const skipSubmitRef = useRef(false);
   const activeTurnAbortRef = useRef<AbortController | null>(null);
   const stopRequestedRef = useRef(false);
+  const startupMcpReportShownRef = useRef(false);
   const maxScrollOffsetRef = useRef(0);
   const pageScrollSizeRef = useRef(10);
   const agentStateRef = useRef<AgentState>({
@@ -869,6 +875,7 @@ function CliApp() {
     if (modelSelected) {
       // env var already set, skip selection
       if (!currentResolved) ensureConfig();
+      primeMcpRuntime();
       scrollHistoryToLatest();
       setMessages([headerItem()]);
     }
@@ -882,6 +889,7 @@ function CliApp() {
     ensureConfig(choice.provider, choice.modelId);
     setModelSelected(true);
     setUserHasChosenModel(true);
+    primeMcpRuntime();
     scrollHistoryToLatest();
     if (isInitialSelection) {
       setMessages([headerItem()]);
@@ -950,8 +958,46 @@ function CliApp() {
       }
 
       if (command === "status") {
+        await ensureMcpInitialized();
         pushMessage("system", sessionStatus(agentStateRef.current), "status");
         return;
+      }
+
+      if (command.startsWith("mcp")) {
+        const mcpArgs = command.slice(3).trim();
+
+        try {
+          if (!mcpArgs) {
+            await ensureMcpInitialized();
+            pushMessage("system", mcpManager.formatStatusReport(), "mcp");
+            return;
+          }
+
+          if (mcpArgs === "refresh") {
+            await refreshMcpFromSettings();
+            agentConfig = createAgentConfig(currentResolved);
+            pushMessage("system", mcpManager.formatStatusReport(), "mcp");
+            return;
+          }
+
+          if (mcpArgs.startsWith("refresh ")) {
+            const serverName = mcpArgs.slice("refresh ".length).trim();
+            if (!serverName) {
+              pushMessage("error", 'Usage: /mcp refresh <name>', "mcp");
+              return;
+            }
+            await refreshMcpFromSettings(serverName);
+            agentConfig = createAgentConfig(currentResolved);
+            pushMessage("system", mcpManager.formatStatusReport(), "mcp");
+            return;
+          }
+
+          pushMessage("error", 'Unknown MCP command. Use "/mcp" or "/mcp refresh [name]".', "mcp");
+          return;
+        } catch (error) {
+          pushMessage("error", error instanceof Error ? error.message : String(error), "mcp");
+          return;
+        }
       }
 
       if (command === "team") {
@@ -1060,6 +1106,9 @@ function CliApp() {
     activeTurnAbortRef.current = abortController;
 
     try {
+      await ensureMcpInitialized();
+      agentConfig = createAgentConfig(currentResolved);
+
       const leadInbox = messageBus.drainInbox("lead");
       if (leadInbox.length > 0) {
         pushMessage("system", formatMailboxMessages(leadInbox), "inbox");
@@ -1262,6 +1311,34 @@ function CliApp() {
       process.stdout.write("\x1b[?1000l\x1b[?1006l");
     };
   }, [internal_eventEmitter, showMainUi]);
+
+  useEffect(() => {
+    if (trusted !== true || !modelSelected || !currentResolved || startupMcpReportShownRef.current) {
+      return;
+    }
+
+    startupMcpReportShownRef.current = true;
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        await ensureMcpInitialized();
+        if (cancelled) {
+          return;
+        }
+        pushMessage("system", mcpManager.formatStartupReport(), "mcp");
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        pushMessage("error", error instanceof Error ? error.message : String(error), "mcp");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [trusted, modelSelected, userHasChosenModel]);
 
   return (
     <Box key={`session-${sessionKey}`} flexDirection="column" paddingX={1} height={terminalSize.rows}>

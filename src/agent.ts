@@ -1,6 +1,7 @@
 import OpenAI, { APIUserAbortError } from "openai";
 
 import { microCompact, estimateTokens, autoCompact, TOKEN_THRESHOLD } from "./compact.js";
+import { getDynamicMcpToolSurface } from "./mcp-runtime.js";
 import { messageBus, teammateManager, LEAD_NAME, TOOLS, CHAT_TOOLS, BASE_TOOLS, BASE_CHAT_TOOLS, TEAMMATE_TOOLS, TEAMMATE_CHAT_TOOLS, BASE_TOOL_HANDLERS, taskManager } from "./tools.js";
 import { renderInboxPrompt } from "./message-bus.js";
 import type { TeammateRuntimeControl } from "./teammate-manager.js";
@@ -15,6 +16,11 @@ type ToolHandler = (args: ToolArgs, control?: RunControl) => Promise<string> | s
 type ToolHandlerMap = Record<string, ToolHandler>;
 type RunControl = {
   signal?: AbortSignal;
+};
+type PreparedToolRuntime = {
+  handlers: ToolHandlerMap;
+  responseTools: readonly any[];
+  chatTools: readonly any[];
 };
 
 export class TurnInterruptedError extends Error {
@@ -150,6 +156,28 @@ When you complete a meaningful chunk, send a concise update to lead.`;
 
 function buildInboxWorkPrompt(): string {
   return "Process the inbox items in order. Use available tools to do the work. Coordinate via message_send when needed.";
+}
+
+async function prepareToolRuntime(
+  baseHandlers: ToolHandlerMap,
+  baseResponseTools: readonly any[],
+  baseChatTools: readonly any[],
+): Promise<PreparedToolRuntime> {
+  const dynamicMcp = await getDynamicMcpToolSurface();
+  return {
+    handlers: {
+      ...baseHandlers,
+      ...dynamicMcp.handlers,
+    },
+    responseTools: [
+      ...baseResponseTools,
+      ...dynamicMcp.responseTools,
+    ],
+    chatTools: [
+      ...baseChatTools,
+      ...dynamicMcp.chatTools,
+    ],
+  };
 }
 
 async function streamResponse(
@@ -384,7 +412,6 @@ function buildSharedTeamHandlers(agentName: string): Pick<ToolHandlerMap, "messa
 
 async function launchTeammateRuntime(config: AgentConfig, control: TeammateRuntimeControl): Promise<void> {
   const bridge = createSilentBridge();
-  const handlers = buildTeammateHandlers(control.name);
 
   while (true) {
     if (!teammateManager.shouldStop(control) && messageBus.inboxSize(control.name) === 0) {
@@ -399,14 +426,19 @@ async function launchTeammateRuntime(config: AgentConfig, control: TeammateRunti
     if (actionableMessages.length > 0) {
       teammateManager.markWorking(control.name);
       const prompt = `${renderInboxPrompt(actionableMessages)}\n\n${buildInboxWorkPrompt()}`;
+      const runtime = await prepareToolRuntime(
+        buildTeammateHandlers(control.name),
+        TEAMMATE_TOOLS,
+        TEAMMATE_CHAT_TOOLS,
+      );
       await runTurn(
         config,
         prompt,
         control.state,
         bridge,
-        handlers,
-        TEAMMATE_TOOLS,
-        TEAMMATE_CHAT_TOOLS,
+        runtime.handlers,
+        runtime.responseTools,
+        runtime.chatTools,
       );
     }
 
@@ -535,6 +567,7 @@ async function subAgentLoopResponses(
   description: string,
   bridge: UiBridge,
 ): Promise<string> {
+  const runtime = await prepareToolRuntime(BASE_TOOL_HANDLERS, BASE_TOOLS, BASE_CHAT_TOOLS);
   let nextInput: ResponseInputItem[] | string = [
     { role: "user", content: [{ type: "input_text", text: description }] },
   ];
@@ -542,7 +575,7 @@ async function subAgentLoopResponses(
   let lastText = "";
 
   for (let round = 0; round < MAX_SUBAGENT_ROUNDS; round += 1) {
-    const response = await streamResponse(client, model, system, false, nextInput, currentResponseId, bridge, BASE_TOOLS);
+    const response = await streamResponse(client, model, system, false, nextInput, currentResponseId, bridge, runtime.responseTools);
     currentResponseId = response.id;
 
     const textItems = Array.isArray(response.output)
@@ -572,7 +605,7 @@ async function subAgentLoopResponses(
 
     const results: ResponseInputItem[] = [];
     for (const toolCall of toolCalls) {
-      results.push(await runToolCall(toolCall, bridge, BASE_TOOL_HANDLERS));
+      results.push(await runToolCall(toolCall, bridge, runtime.handlers));
     }
     nextInput = results;
   }
@@ -587,11 +620,12 @@ async function subAgentLoopChatCompletions(
   description: string,
   bridge: UiBridge,
 ): Promise<string> {
+  const runtime = await prepareToolRuntime(BASE_TOOL_HANDLERS, BASE_TOOLS, BASE_CHAT_TOOLS);
   const history: ChatMessage[] = [{ role: "user", content: description }];
   let lastText = "";
 
   for (let round = 0; round < MAX_SUBAGENT_ROUNDS; round += 1) {
-    const message = await streamChatCompletion(client, model, system, history, bridge, BASE_CHAT_TOOLS, false);
+    const message = await streamChatCompletion(client, model, system, history, bridge, runtime.chatTools, false);
 
     const assistantText = extractAssistantText(message.content);
     if (assistantText.trim()) {
@@ -611,7 +645,7 @@ async function subAgentLoopChatCompletions(
     for (const toolCall of toolCalls) {
       const name = String(toolCall.function?.name ?? "unknown_tool");
       const args = safeJsonParse(String(toolCall.function?.arguments ?? "{}"));
-      const handler = BASE_TOOL_HANDLERS[name];
+      const handler = runtime.handlers[name];
       const outputText = handler ? await handler(args) : `Unknown tool: ${name}`;
       bridge.pushTool(name, args, outputText);
 
@@ -848,6 +882,6 @@ export async function runAgentTurn(
   bridge: UiBridge,
   control?: RunControl,
 ): Promise<void> {
-  const handlers = buildLeadHandlers(config, bridge);
-  await runTurn(config, query, state, bridge, handlers, TOOLS, CHAT_TOOLS, control);
+  const runtime = await prepareToolRuntime(buildLeadHandlers(config, bridge), TOOLS, CHAT_TOOLS);
+  await runTurn(config, query, state, bridge, runtime.handlers, runtime.responseTools, runtime.chatTools, control);
 }
