@@ -30,6 +30,7 @@ export type MailboxMessage = {
 export type TeammateRuntimeState = {
   name: string;
   role: string;
+  sessionId: string;
   previousResponseId?: string;
   responseHistory: ResponseInputItem[];
   chatHistory: ChatMessage[];

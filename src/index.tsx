@@ -3,7 +3,6 @@
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { EventEmitter } from "node:events";
 
 import { config as loadDotenv } from "dotenv";
 import fs from "node:fs";
@@ -24,6 +23,7 @@ import {
   getSettingsPath,
   loadCredentialsFile,
   loadSettings,
+  needsModelSelection,
   normalizeModelEntry,
   reloadSettings,
   resolveConfig,
@@ -36,7 +36,7 @@ import {
   type StoredOAuthCredentials,
 } from "./config.js";
 import { estimateTokens, autoCompact } from "./compact.js";
-import { normalizeCommand } from "./commands.js";
+import { normalizeCommand, parseStartupCommand } from "./commands.js";
 import { createSubmitDeduper, getSubmittedValueFromInput } from "./input-submit.js";
 import { formatMailboxMessages, renderInboxPrompt } from "./message-bus.js";
 import { ensureMcpInitialized, getMcpPromptInstructions, mcpManager, primeMcpRuntime, refreshMcpFromSettings } from "./mcp/runtime.js";
@@ -49,8 +49,9 @@ import {
   startOpenAILogin,
 } from "./oauth/openai.js";
 import { buildSystemPrompt } from "./prompt.js";
+import { appendSessionCheckpoint, createSessionId, listRecentSessions, loadSession, type SessionSnapshot } from "./session-store.js";
 import { skillLoader, messageBus, teammateManager } from "./tools.js";
-import type { AgentState, DiffLine, UiBridge, UiMessage } from "./types.js";
+import type { AgentState, DiffLine, PersistedUiMessage, UiBridge, UiMessage } from "./types.js";
 import { ellipsize } from "./utils.js";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -132,7 +133,7 @@ async function refreshCurrentAuth(): Promise<void> {
   agentConfig = createAgentConfig(currentResolved, currentAuthState);
 }
 
-// If MODEL_ID env var is set, initialize immediately (skip interactive selection)
+// Initialize immediately when startup can resolve a usable model without prompting.
 if (!needsModelSelection()) {
   ensureConfig();
 }
@@ -162,13 +163,6 @@ function buildModelChoices(): ModelChoice[] {
   return choices;
 }
 
-/** Whether the user needs to pick a model interactively */
-function needsModelSelection(): boolean {
-  // If env var already specifies everything, skip
-  if (process.env.MODEL_ID) return false;
-  return true;
-}
-
 type TrustPromptProps = Readonly<{ selectedIndex: number }>;
 type StringRef = { current: string | undefined };
 type ViewportRow = {
@@ -187,6 +181,12 @@ type SlashCommand = {
 type SkillSlashInvocation = {
   command: string;
   args?: string;
+};
+
+type StartupResumeState = {
+  snapshot?: SessionSnapshot;
+  startupMessage?: UiMessage;
+  hasResolvedModel: boolean;
 };
 
 /**
@@ -223,6 +223,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { command: "/model", description: "switch model within current provider" },
   { command: "/compact", description: "compact conversation history to free context space" },
   { command: "/new", description: "clear context and start a new conversation" },
+  { command: "/resume", description: "list recent saved sessions or restore one by id" },
   { command: "/exit", description: "exit the CLI" },
 ];
 
@@ -252,8 +253,6 @@ function getAllSlashCommands(): SlashCommand[] {
   return [...commands.values()].sort((left, right) => left.command.localeCompare(right.command));
 }
 
-const MOUSE_INPUT_SEQUENCE_RE = /^\u001b\[<(\d+);(\d+);(\d+)([Mm])$/;
-
 function formatDuration(ms: number): string {
   const seconds = Math.max(0, Math.floor(ms / 1000));
   const minutes = Math.floor(seconds / 60);
@@ -270,20 +269,6 @@ function stripAnsi(text: string): string {
 
 function toolPreview(value: string, maxLength = 400): string {
   return ellipsize(value.replaceAll(/\s+/g, " ").trim(), maxLength);
-}
-
-function parseMouseInputSequence(input: string): { kind: "wheel"; delta: number } | { kind: "other" } | null {
-  const match = MOUSE_INPUT_SEQUENCE_RE.exec(input);
-  if (!match) {
-    return null;
-  }
-
-  const code = Number(match[1]);
-  if ((code & 64) === 64) {
-    return { kind: "wheel", delta: (code & 1) === 0 ? 3 : -3 };
-  }
-
-  return { kind: "other" };
 }
 
 type ToolDisplay = {
@@ -466,7 +451,7 @@ function configMessage(): UiMessage {
     id: "config",
     kind: "system",
     title: "config",
-    text: `provider=${currentResolved.providerName} model=${currentResolved.model} baseURL=${currentResolved.baseURL} apiMode=${currentResolved.apiMode}`,
+    text: `provider=${currentResolved.providerName} model=${currentResolved.model} configuredBaseURL=${currentResolved.baseURL} effectiveBaseURL=${getEffectiveBaseURL(currentResolved, currentAuthState)} apiMode=${currentResolved.apiMode}`,
   };
 }
 
@@ -488,6 +473,48 @@ function formatAuthSummary(state?: ProviderAuthState): string {
     return "auth apiKey";
   }
   return "auth none";
+}
+
+/**
+ * 返回当前会话真正用于请求模型的 endpoint。
+ *
+ * 为什么不能只看配置里的 `baseURL`：
+ * - `ResolvedConfig.baseURL` 反映的是 provider 静态配置，便于用户理解和持久化，
+ *   但不代表运行时一定按它发请求。
+ * - OpenAI OAuth 是一个特殊分支：配置仍然指向公开 API，实际请求却会改走
+ *   ChatGPT Codex backend。
+ * - 统一用这个 helper 计算“生效中的 endpoint”，可以让 `/status`、调试信息
+ *   和底部状态栏保持一致，避免排障时看到互相矛盾的地址。
+ */
+function getEffectiveBaseURL(resolved: ResolvedConfig, authState?: ProviderAuthState): string {
+  const usesOpenAICodexBackend = resolved.providerName === "openai"
+    && authState?.authMode === "oauth"
+    && Boolean(authState.oauth);
+
+  return usesOpenAICodexBackend ? OPENAI_CODEX_BASE_URL : resolved.baseURL;
+}
+
+/**
+ * Show credential problems directly in the welcome panel because a configured
+ * `defaultModel` can now bypass the selection screen entirely.
+ *
+ * Why this exists:
+ * - Users should see the problem before the first request fails.
+ * - OAuth-backed providers need a login reminder, while API-key providers need
+ *   a config reminder. The fixes are different, so the warning should be too.
+ */
+function getProviderStartupAuthWarning(): string | null {
+  if (!currentResolved || !currentAuthState || currentAuthState.authMode !== "none") {
+    return null;
+  }
+
+  const settings = loadSettings();
+  const provider = settings.providers[currentResolved.providerName];
+  if (!provider) {
+    return null;
+  }
+
+  return provider.auth?.type === "oauth" ? "未登录" : "未配置API";
 }
 
 function headerItem(): UiMessage {
@@ -517,6 +544,7 @@ function getMessagePalette(kind: UiMessage["kind"]): { titleColor: string; bodyC
 
 function WelcomePanel({ width, messages }: { width: number; messages: UiMessage[] }) {
   const contentWidth = Math.max(20, width - 4);
+  const authWarning = getProviderStartupAuthWarning();
 
   return (
     <Box
@@ -548,7 +576,10 @@ function WelcomePanel({ width, messages }: { width: number; messages: UiMessage[
         <Box flexGrow={1} flexDirection="column" paddingLeft={2}>
           <Text bold color="red">Tips for getting started</Text>
           <Text>Run <Text color="whiteBright">/help</Text> to see commands, <Text color="whiteBright">/model</Text> to switch models.</Text>
-          <Text>Use <Text color="whiteBright">/new</Text> to reset the session and keep the terminal clean.</Text>
+          <Text>Use <Text color="whiteBright">/new</Text> to reset, or <Text color="whiteBright">/resume</Text> to reopen a saved session.</Text>
+          {authWarning
+            ? <Text color="red">当前 provider {authWarning}。请先配置 API，或者完成 /login。</Text>
+            : null}
         </Box>
       </Box>
     </Box>
@@ -588,6 +619,7 @@ function helpMessage(): string {
     "model [name]        switch model within current provider",
     "compact             compact conversation history to free context space",
     "new                 clear context and start a new conversation",
+    "resume [sessionId]  list recent sessions or restore one",
     "exit                exit the CLI",
     skillsLine,
     "",
@@ -606,6 +638,7 @@ function sessionStatus(state: AgentState): string {
   const modelsLine = currentResolved.availableModels.length > 0
     ? `models   ${currentResolved.availableModels.join(", ")}`
     : "";
+  const effectiveBaseURL = getEffectiveBaseURL(currentResolved, currentAuthState);
   return [
     `workspace ${WORKDIR}`,
     `provider ${currentResolved.providerName}`,
@@ -613,13 +646,179 @@ function sessionStatus(state: AgentState): string {
     modelsLine,
     `api mode ${currentResolved.apiMode}`,
     `baseURL  ${currentResolved.baseURL}`,
+    `effective endpoint ${effectiveBaseURL}`,
     formatAuthSummary(currentAuthState),
+    `session  ${state.sessionId}`,
     `turns    ${state.turnCount}`,
     `context  ~${estimateActiveContextTokens(state)} tokens | compacted: ${state.compactCount} times`,
     `mcp      ${mcpSummary.connected} connected | ${mcpSummary.degraded} degraded | ${mcpSummary.disconnected} disconnected | ${mcpSummary.enabled} enabled`,
     `team     ${teammateManager.listMembers().length} teammates | lead inbox: ${messageBus.inboxSize("lead")}`,
     `uptime   ${formatDuration(Date.now() - state.launchedAt)}`,
   ].filter(Boolean).join("\n");
+}
+
+/**
+ * 把运行时 UI 消息裁成可落盘的结构。
+ *
+ * 为什么不直接保存完整 `UiMessage`：
+ * - `id` 只服务当前渲染树，恢复后重新分配更简单，也能避免和新消息冲突。
+ * - header 这类纯展示占位消息不属于真实会话内容，恢复时重新生成即可。
+ * - 持久化层只保留继续会话所需的信息，避免把瞬时渲染细节写进 transcript。
+ */
+function serializeMessages(messages: UiMessage[]): PersistedUiMessage[] {
+  return messages
+    .filter((message) => message.id !== "header")
+    .map((message) => ({
+      kind: message.kind,
+      title: message.title,
+      subtitle: message.subtitle,
+      text: message.text,
+      diffLines: message.diffLines ? [...message.diffLines] : undefined,
+      collapsed: message.collapsed,
+    }));
+}
+
+/**
+ * 把落盘消息恢复成当前会话可渲染的 `UiMessage`。
+ *
+ * 为什么恢复时重建 ID：
+ * - Ink 的消息列表只要求本次进程内唯一，不要求跨会话稳定。
+ * - 按顺序重新编号可以让恢复逻辑保持纯函数，不依赖旧进程的计数器状态。
+ * - 这也保证后续新增消息继续接在末尾，不会撞上历史 ID。
+ */
+function restoreMessages(messages: PersistedUiMessage[]): UiMessage[] {
+  return messages.map((message, index) => ({
+    id: `message-${index + 1}`,
+    kind: message.kind,
+    title: message.title,
+    subtitle: message.subtitle,
+    text: message.text,
+    diffLines: message.diffLines ? [...message.diffLines] : undefined,
+    collapsed: message.collapsed,
+  }));
+}
+
+/**
+ * 生成当前会话的持久化快照。
+ *
+ * 为什么快照里同时放 `AgentState` 和 UI 消息：
+ * - 仅恢复 `chatHistory/responseHistory` 只能让模型继续工作，但用户会看到空白界面。
+ * - 仅恢复 UI 消息又无法把模型上下文接上，等于只是“查看历史”而不是继续会话。
+ * - 两者一起保存可以把 `/resume` 做成真正的“从上次中断处继续”。
+ */
+function buildSessionSnapshot(state: AgentState, messages: UiMessage[]): SessionSnapshot {
+  return {
+    state: {
+      ...state,
+      responseHistory: JSON.parse(JSON.stringify(state.responseHistory)),
+      chatHistory: JSON.parse(JSON.stringify(state.chatHistory)),
+    },
+    messages: serializeMessages(messages),
+    providerName: currentResolved?.providerName,
+    model: currentResolved?.model,
+    apiMode: currentResolved?.apiMode,
+    savedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * 把最近 session 列表格式化成 CLI 可读文本。
+ *
+ * 为什么保留短标题和 turns：
+ * - 恢复操作的本质是帮助用户从多个历史上下文里快速定位目标会话。
+ * - 仅显示 sessionId 太难识别，标题能提供主题，turn 数和模型能补充上下文规模。
+ * - 文本格式保持简单，后续若要改成交互选择器也可以直接复用这份摘要数据。
+ */
+function formatRecentSessions(currentSessionId: string): string {
+  const sessions = listRecentSessions(WORKDIR);
+  if (sessions.length === 0) {
+    return "No saved sessions for this workspace yet.";
+  }
+
+  return [
+    "Recent sessions:",
+    ...sessions.map((session) => {
+      const activeMark = session.sessionId === currentSessionId ? " ← current" : "";
+      const modelInfo = [session.providerName, session.model].filter(Boolean).join("/");
+      const suffix = modelInfo ? ` · ${modelInfo}` : "";
+      return `  ${session.sessionId}${activeMark} · ${session.turnCount} turns · ${session.savedAt}${suffix}\n    ${session.title}`;
+    }),
+    "",
+    "Use /resume <sessionId> to restore one.",
+  ].join("\n");
+}
+
+/**
+ * Resolve startup argv into an optional preloaded session snapshot.
+ *
+ * Why this happens before Ink mounts:
+ * - `xbcode resume <id>` should land in the restored session immediately
+ *   instead of booting an empty UI and then replaying a command.
+ * - Startup restore may also need to switch provider/model first so the in-memory
+ *   agent state matches the resumed transcript before the first turn.
+ * - Returning a small structured result lets the UI reuse the same rendering
+ *   path whether startup resume succeeded, failed, or only requested a list.
+ */
+function resolveStartupResumeState(): StartupResumeState {
+  const startupCommand = parseStartupCommand(process.argv.slice(2));
+  if (startupCommand.kind !== "resume") {
+    return {
+      hasResolvedModel: !needsModelSelection(),
+    };
+  }
+
+  if (!startupCommand.sessionId) {
+    return {
+      startupMessage: {
+        id: "startup-resume",
+        kind: "system",
+        title: "resume",
+        text: formatRecentSessions(""),
+      },
+      hasResolvedModel: !needsModelSelection(),
+    };
+  }
+
+  const snapshot = loadSession(WORKDIR, startupCommand.sessionId);
+  if (!snapshot) {
+    return {
+      startupMessage: {
+        id: "startup-resume",
+        kind: "error",
+        title: "resume",
+        text: `Session not found: "${startupCommand.sessionId}"`,
+      },
+      hasResolvedModel: !needsModelSelection(),
+    };
+  }
+
+  let hasResolvedModel = !needsModelSelection();
+  let startupMessage: UiMessage | undefined = {
+    id: "startup-resume",
+    kind: "system",
+    title: "resume",
+    text: `Resumed session ${snapshot.state.sessionId}.`,
+  };
+
+  if (snapshot.providerName && snapshot.model) {
+    try {
+      ensureConfig(snapshot.providerName, snapshot.model);
+      hasResolvedModel = true;
+    } catch (error) {
+      startupMessage = {
+        id: "startup-resume",
+        kind: "error",
+        title: "resume",
+        text: `Restored session state, but could not switch model to ${snapshot.providerName}/${snapshot.model}: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  return {
+    snapshot,
+    startupMessage,
+    hasResolvedModel,
+  };
 }
 
 function buildLeadInboxQuery(inboxPrompt: string, userQuery: string): string {
@@ -868,15 +1067,36 @@ function ModelSelectPrompt({ choices, selectedIndex, activeModelId }: ModelSelec
   );
 }
 
-function CliApp() {
+function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
   const { exit } = useApp();
-  const { internal_eventEmitter } = useStdin();
-  const [messages, setMessages] = useState<UiMessage[]>([]);
+  useStdin();
+  const initialRestoredMessages = startupResume.snapshot ? restoreMessages(startupResume.snapshot.messages) : [];
+  const initialMessages = [
+    headerItem(),
+    ...initialRestoredMessages,
+    ...(startupResume.startupMessage ? [startupResume.startupMessage] : []),
+  ];
+  const [messages, setMessages] = useState<UiMessage[]>(initialMessages);
+  const messagesRef = useRef<UiMessage[]>([]);
   const [inputValue, setInputValue] = useState("");
   const [busy, setBusy] = useState(false);
   const [trusted, setTrusted] = useState<boolean | null>(null);
-  const [modelSelected, setModelSelected] = useState<boolean>(!needsModelSelection());
-  const [userHasChosenModel, setUserHasChosenModel] = useState(false);
+  /**
+   * Startup can begin with a fully resolved model when either:
+   * - the user set `MODEL_ID` for this shell session, or
+   * - persisted defaults already point at a valid configured model.
+   *
+   * Why this state is initialized eagerly:
+   * - The render tree has two different concerns: whether the picker is open
+   *   (`modelSelected`) and whether the footer should describe an active model
+   *   (`userHasChosenModel`).
+   * - When startup skips the picker we must mark both as ready immediately,
+   *   otherwise the UI ends up in a contradictory state where the header and
+   *   status bar show a model while the footer still says "No model selected".
+   */
+  const startupHasResolvedModel = startupResume.hasResolvedModel;
+  const [modelSelected, setModelSelected] = useState<boolean>(startupHasResolvedModel);
+  const [userHasChosenModel, setUserHasChosenModel] = useState(startupHasResolvedModel);
   const [trustSelection, setTrustSelection] = useState(0);
   const [modelSelectionIndex, setModelSelectionIndex] = useState(0);
   const [slashSelection, setSlashSelection] = useState(0);
@@ -887,7 +1107,7 @@ function CliApp() {
     rows: process.stdout.rows ?? 24,
   });
 
-  const messageCounterRef = useRef(0);
+  const messageCounterRef = useRef(initialRestoredMessages.length + (startupResume.startupMessage ? 1 : 0));
   const [sessionKey, setSessionKey] = useState(0);
   const assistantMessageIdRef = useRef<string | undefined>(undefined);
   const thinkingMessageIdRef = useRef<string | undefined>(undefined);
@@ -900,12 +1120,15 @@ function CliApp() {
   const maxScrollOffsetRef = useRef(0);
   const pageScrollSizeRef = useRef(10);
   const agentStateRef = useRef<AgentState>({
-    responseHistory: [],
-    chatHistory: [],
-    turnCount: 0,
-    launchedAt: Date.now(),
-    roundsSinceTask: 0,
-    compactCount: 0,
+    ...(startupResume.snapshot?.state ?? {
+      sessionId: createSessionId(),
+      responseHistory: [],
+      chatHistory: [],
+      turnCount: 0,
+      launchedAt: Date.now(),
+      roundsSinceTask: 0,
+      compactCount: 0,
+    }),
   });
 
   const slashMatches = findSlashCommandMatches(inputValue);
@@ -917,6 +1140,14 @@ function CliApp() {
     setSlashSelection(0);
   }, [inputValue]);
 
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  useEffect(() => {
+    messagesRef.current = initialMessages;
+  }, []);
+
   const requestExit = () => {
     /**
      * 这里只依赖 Ink 的 exit() 不够稳妥：
@@ -924,6 +1155,9 @@ function CliApp() {
      * 用户就会看到 `/exit` 像是“没反应”。因此这里先走正常卸载，
      * 再在下一个 tick 强制结束进程，确保命令语义就是立即退出。
      */
+    if (messagesRef.current.length > 1) {
+      persistCurrentSession();
+    }
     exit();
     setImmediate(() => {
       process.exit(0);
@@ -962,10 +1196,27 @@ function CliApp() {
   const pushMessage = (kind: UiMessage["kind"], text: string, title?: string) => {
     messageCounterRef.current += 1;
     const id = `message-${messageCounterRef.current}`;
-    setMessages((current) => [
-      ...current,
-      { id, kind, title, text },
-    ]);
+    setMessages((current) => {
+      const next = [...current, { id, kind, title, text }];
+      messagesRef.current = next;
+      return next;
+    });
+  };
+
+  /**
+   * 把当前会话安全地写入本地 transcript。
+   *
+   * 为什么把持久化失败吞成系统消息而不是直接抛错：
+   * - 会话保存属于增强能力，不能因为磁盘问题阻断主对话流程。
+   * - 用户仍然需要知道“恢复能力不可用”，所以这里转成可见告警最合适。
+   * - 写入始终基于当前内存态快照，不依赖异步队列，避免进程退出时再丢一次。
+   */
+  const persistCurrentSession = () => {
+    try {
+      appendSessionCheckpoint(WORKDIR, buildSessionSnapshot(agentStateRef.current, messagesRef.current));
+    } catch (error) {
+      pushMessage("error", `Failed to save session: ${error instanceof Error ? error.message : String(error)}`, "session");
+    }
   };
 
   const appendStreamingMessage = (kind: "assistant" | "thinking", ref: StringRef, delta: string, title?: string) => {
@@ -977,10 +1228,14 @@ function CliApp() {
       if (!ref.current) {
         messageCounterRef.current += 1;
         ref.current = `message-${messageCounterRef.current}`;
-        return [...current, { id: ref.current, kind, title, text: delta }];
+        const next = [...current, { id: ref.current, kind, title, text: delta }];
+        messagesRef.current = next;
+        return next;
       }
 
-      return current.map((message) => (message.id === ref.current ? { ...message, text: `${message.text}${delta}` } : message));
+      const next = current.map((message) => (message.id === ref.current ? { ...message, text: `${message.text}${delta}` } : message));
+      messagesRef.current = next;
+      return next;
     });
   };
 
@@ -1008,28 +1263,33 @@ function CliApp() {
       if (display) {
         messageCounterRef.current += 1;
         const id = `message-${messageCounterRef.current}`;
-        setMessages((current) => [
-          ...current,
-          {
-            id,
-            kind: "tool" as const,
-            title: display.title,
-            subtitle: display.subtitle,
-            text: "",
-            diffLines: display.lines.map((l) => ({ text: l.text, color: l.color })),
-          },
-        ]);
+        setMessages((current) => {
+          const next = [
+            ...current,
+            {
+              id,
+              kind: "tool" as const,
+              title: display.title,
+              subtitle: display.subtitle,
+              text: "",
+              diffLines: display.lines.map((l) => ({ text: l.text, color: l.color })),
+            },
+          ];
+          messagesRef.current = next;
+          return next;
+        });
       } else {
         pushMessage("tool", `args  ${toolPreview(JSON.stringify(args))}\nresult  ${toolPreview(result)}`, `tool ${name}`);
       }
     },
   };
 
-  const resetConversation = () => {
+  const resetConversation = (snapshot?: SessionSnapshot) => {
     assistantMessageIdRef.current = undefined;
     thinkingMessageIdRef.current = undefined;
     scrollHistoryToLatest();
-    agentStateRef.current = {
+    agentStateRef.current = snapshot?.state ?? {
+      sessionId: createSessionId(),
       responseHistory: [],
       chatHistory: [],
       turnCount: 0,
@@ -1037,11 +1297,14 @@ function CliApp() {
       roundsSinceTask: 0,
       compactCount: 0,
     };
-    messageCounterRef.current = 0;
+
+    const restoredMessages = snapshot ? restoreMessages(snapshot.messages) : [];
+    messageCounterRef.current = restoredMessages.length;
     // Clear the terminal then remount <Static> with fresh messages.
     process.stdout.write("\x1B[2J\x1B[3J\x1B[H");
     setSessionKey((k) => k + 1);
-    setMessages([headerItem()]);
+    messagesRef.current = [headerItem(), ...restoredMessages];
+    setMessages(messagesRef.current);
   };
 
   const requestActiveTurnStop = () => {
@@ -1060,9 +1323,13 @@ function CliApp() {
     if (modelSelected) {
       // env var already set, skip selection
       if (!currentResolved) ensureConfig();
+      setUserHasChosenModel(true);
       primeMcpRuntime();
       scrollHistoryToLatest();
-      setMessages([headerItem()]);
+      if (messagesRef.current.length === 0) {
+        messagesRef.current = [headerItem()];
+        setMessages(messagesRef.current);
+      }
     }
   };
 
@@ -1076,8 +1343,9 @@ function CliApp() {
     setUserHasChosenModel(true);
     primeMcpRuntime();
     scrollHistoryToLatest();
-    if (isInitialSelection) {
-      setMessages([headerItem()]);
+    if (isInitialSelection && messagesRef.current.length <= 1) {
+      messagesRef.current = [headerItem()];
+      setMessages(messagesRef.current);
     } else {
       // Clear screen and rebuild <Static> to avoid Ink re-rendering stale items out of order
       messageCounterRef.current += 1;
@@ -1089,7 +1357,11 @@ function CliApp() {
       };
       process.stdout.write("\x1B[2J\x1B[3J\x1B[H");
       setSessionKey((k) => k + 1);
-      setMessages((current) => [...current, switchMsg]);
+      setMessages((current) => {
+        const next = [...current, switchMsg];
+        messagesRef.current = next;
+        return next;
+      });
     }
   };
 
@@ -1199,6 +1471,37 @@ function CliApp() {
 
       if (command === "new") {
         resetConversation();
+        return;
+      }
+
+      if (command.startsWith("resume")) {
+        const sessionArg = command.slice(6).trim();
+        if (!sessionArg) {
+          pushMessage("system", formatRecentSessions(agentStateRef.current.sessionId), "resume");
+          return;
+        }
+
+        const snapshot = loadSession(WORKDIR, sessionArg);
+        if (!snapshot) {
+          pushMessage("error", `Session not found: "${sessionArg}"`, "resume");
+          return;
+        }
+
+        if (snapshot.providerName && snapshot.model) {
+          try {
+            ensureConfig(snapshot.providerName, snapshot.model);
+            setUserHasChosenModel(true);
+          } catch (error) {
+            pushMessage(
+              "error",
+              `Restored session state, but could not switch model to ${snapshot.providerName}/${snapshot.model}: ${error instanceof Error ? error.message : String(error)}`,
+              "resume",
+            );
+          }
+        }
+
+        resetConversation(snapshot);
+        pushMessage("system", `Resumed session ${snapshot.state.sessionId}.`, "resume");
         return;
       }
 
@@ -1403,6 +1706,7 @@ function CliApp() {
           }
         } finally {
           finalizeStreaming();
+          persistCurrentSession();
           activeTurnAbortRef.current = null;
           stopRequestedRef.current = false;
           setBusy(false);
@@ -1447,6 +1751,7 @@ function CliApp() {
       }
     } finally {
       finalizeStreaming();
+      persistCurrentSession();
       activeTurnAbortRef.current = null;
       stopRequestedRef.current = false;
       setBusy(false);
@@ -1485,7 +1790,8 @@ function CliApp() {
         setModelSelected(true);
         if (!currentResolved) ensureConfig();
         scrollHistoryToLatest();
-        setMessages([headerItem()]);
+        messagesRef.current = [headerItem()];
+        setMessages(messagesRef.current);
         return;
       }
       return;
@@ -1619,30 +1925,25 @@ function CliApp() {
       return;
     }
 
-    const emitter = internal_eventEmitter as EventEmitter;
-    const originalEmit = emitter.emit.bind(emitter);
-    const patchedEmit: EventEmitter["emit"] = ((eventName: string | symbol, ...args: unknown[]) => {
-      if (eventName === "input" && typeof args[0] === "string") {
-        const mouseInput = parseMouseInputSequence(args[0]);
-        if (mouseInput) {
-          if (mouseInput.kind === "wheel") {
-            setScrollOffset((current) => Math.max(0, Math.min(maxScrollOffsetRef.current, current + mouseInput.delta)));
-          }
-          return false;
-        }
-      }
-
-      return originalEmit(eventName, ...args);
-    }) as EventEmitter["emit"];
-
-    emitter.emit = patchedEmit;
-    process.stdout.write("\x1b[?1000h\x1b[?1006h");
+    /**
+     * 这里不再打开 SGR 鼠标追踪。
+     *
+     * 原因：
+     * - 之前启用 `1000/1006` 后，终端会把点击和拖拽都交给应用，而不是交给终端模拟器做原生文本选择。
+     * - 当前项目只实现了滚轮滚动，没有实现点击选中文本和复制，所以用户一旦点进 UI，拖选复制就会失效。
+     * - 改成开启 `1007` alternate scroll 后，支持该模式的终端会把滚轮转换成上下导航键，同时不会劫持普通鼠标点击。
+     *
+     * 这样做的目标是：
+     * - 保留终端原生的鼠标拖选/复制；
+     * - 尽量继续保留滚轮浏览历史；
+     * - 避免为了修复制问题而引入一整套复杂的自定义文本选择实现。
+     */
+    process.stdout.write("\x1b[?1007h");
 
     return () => {
-      emitter.emit = originalEmit;
-      process.stdout.write("\x1b[?1000l\x1b[?1006l");
+      process.stdout.write("\x1b[?1007l");
     };
-  }, [internal_eventEmitter, showMainUi]);
+  }, [showMainUi]);
 
   useEffect(() => {
     if (trusted !== true || !modelSelected || !currentResolved || startupMcpReportShownRef.current) {
@@ -1741,7 +2042,7 @@ function CliApp() {
             ) : null}
             <Text color="white" wrap="truncate">{borderRule(innerWidth)}</Text>
             {userHasChosenModel && currentResolved
-              ? <Text color="gray">{currentResolved.providerName}: {currentResolved.model} | api: {currentResolved.apiMode} | {ellipsize(currentResolved.baseURL, 40)}</Text>
+              ? <Text color="gray">{currentResolved.providerName}: {currentResolved.model} | api: {currentResolved.apiMode} | {ellipsize(getEffectiveBaseURL(currentResolved, currentAuthState), 40)}</Text>
               : <Text color="red">No model selected. Use /model to select one.</Text>}
           </Box>
         </>
@@ -1750,7 +2051,8 @@ function CliApp() {
   );
 }
 
-const app = render(<CliApp />, { exitOnCtrlC: false });
+const startupResume = resolveStartupResumeState();
+const app = render(<CliApp startupResume={startupResume} />, { exitOnCtrlC: false });
 await app.waitUntilExit();
 /**
  * Ink 的 exit() 只保证卸载 TUI，不保证 Node 进程一定结束。

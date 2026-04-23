@@ -6,6 +6,18 @@
 
 The project is positioned as a compact, hackable alternative to heavier coding agents: small enough to read end-to-end, but already opinionated enough to be useful in day-to-day coding workflows.
 
+## Project Status
+
+`xbcode` is an early open source product focused on being practical, readable, and easy to extend. The current priority is reliability, usability, and contributor experience.
+
+Related project docs:
+
+- [Roadmap](./ROADMAP.md)
+- [Changelog](./CHANGELOG.md)
+- [Contributing](./CONTRIBUTING.md)
+- [Security Policy](./SECURITY.md)
+- [Code of Conduct](./CODE_OF_CONDUCT.md)
+
 ## Features
 
 - Terminal-first interactive coding agent UI built with Ink and React

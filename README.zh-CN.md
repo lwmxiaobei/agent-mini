@@ -72,6 +72,7 @@ npm run dev
     }
   },
   "defaultProvider": "openai",
+  "defaultModel": "gpt-4.1",
   "showThinking": false,
   "mcp": {
     "servers": []
@@ -106,7 +107,7 @@ npm start
 读取当前项目结构，并解释 agent loop 是怎么工作的。
 ```
 
-如果环境变量里没有预先指定 `MODEL_ID`，CLI 会根据 `~/.xbcode/settings.json` 引导你选择 provider 和 model。
+如果环境变量里没有预先指定 `MODEL_ID`，并且 `~/.xbcode/settings.json` 里也没有可用的 `defaultModel`，CLI 会引导你选择 provider 和 model。
 
 ## 使用说明
 
@@ -470,6 +471,13 @@ code-agent/
   一次性、隔离上下文的子代理
 - teammate
   持久存在、带身份和 inbox 的协作代理
+
+当前 `task` 已支持最小化的 `subagent_type`：
+
+- `general-purpose`
+  默认子代理，适合实现、修改和一般性分包
+- `explore`
+  只读探索子代理，适合搜索代码、阅读实现、整理结论，不允许写文件
 
 简单理解：
 

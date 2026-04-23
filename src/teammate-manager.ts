@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { MessageBus } from "./message-bus.js";
+import { createSessionId } from "./session-store.js";
 import type { TeamConfig, TeamMemberStatus, TeammateRecord, TeammateRuntimeState } from "./team-types.js";
 
 export type TeammateRuntimeControl = {
@@ -99,6 +100,7 @@ export class TeammateManager {
     return {
       name,
       role,
+      sessionId: createSessionId(),
       responseHistory: [],
       chatHistory: [],
       turnCount: 0,

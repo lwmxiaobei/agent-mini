@@ -26,6 +26,7 @@ export type ProviderAuthConfig = {
 export type Settings = {
   providers: Record<string, ModelProfile>;
   defaultProvider?: string;
+  defaultModel?: string;
   showThinking?: boolean;
   mcp?: {
     servers: McpServerConfig[];
@@ -272,7 +273,17 @@ export function resolveConfig(providerName?: string, modelName?: string): Resolv
   const provider = settings.providers[targetProvider];
 
   const availableModels = (provider?.models ?? []).map((m) => normalizeModelEntry(m).id);
-  const model = modelName ?? "";
+  /**
+   * Resolve the active model from the strongest available source so startup can
+   * skip the interactive picker when the user has already chosen a stable
+   * default model.
+   *
+   * Why this order matters:
+   * - Explicit runtime switches must win for the current session.
+   * - `MODEL_ID` remains the strongest shell-level override.
+   * - `defaultModel` gives `settings.json` a persistent default model.
+   */
+  const model = modelName ?? process.env.MODEL_ID ?? settings.defaultModel ?? "";
   const apiKey = provider?.apiKey ?? "";
   const baseURL = provider?.baseURL ?? "https://api.openai.com/v1";
   const apiMode = resolveApiMode(baseURL, provider?.apiMode);
@@ -287,6 +298,51 @@ export function resolveConfig(providerName?: string, modelName?: string): Resolv
     providerName: targetProvider,
     availableModels,
   };
+}
+
+/**
+ * Evaluate whether a resolved startup config is complete enough to skip the
+ * interactive model picker.
+ *
+ * Why this exists:
+ * - The UI needs a deterministic rule, but tests should not have to depend on
+ *   the real `~/.xbcode/settings.json` on the current machine.
+ * - Splitting the pure decision from filesystem-backed config loading keeps the
+ *   startup path easy to verify without mutating user state.
+ * - The shell-level override must remain a first-class bypass so ad-hoc runs
+ *   can pin a model even before settings metadata catches up.
+ */
+export function shouldPromptForModelSelection(
+  resolved: Pick<ResolvedConfig, "providerName" | "model" | "availableModels">,
+  hasShellModelOverride = false,
+): boolean {
+  if (!resolved.providerName || !resolved.model) {
+    return true;
+  }
+
+  if (hasShellModelOverride) {
+    return false;
+  }
+
+  return !resolved.availableModels.includes(resolved.model);
+}
+
+/**
+ * Decide whether startup must ask the user to pick a model interactively.
+ *
+ * Why this exists:
+ * - Startup needs one consistent rule that matches the documented precedence:
+ *   explicit arg > `MODEL_ID` > `settings.defaultModel`.
+ * - `MODEL_ID` is intentionally a shell-level override, so it must be allowed to
+ *   bypass the picker even when the local settings file has not listed that
+ *   model yet.
+ * - Persistent config values should still be validated against the configured
+ *   provider model list so broken saved settings continue to fall back to the
+ *   chooser instead of failing later with a surprising runtime state.
+ */
+export function needsModelSelection(providerName?: string, modelName?: string): boolean {
+  const resolved = resolveConfig(providerName, modelName);
+  return shouldPromptForModelSelection(resolved, !modelName && Boolean(process.env.MODEL_ID));
 }
 
 function normalizeAuthConfig(
@@ -636,6 +692,7 @@ export function normalizeSettings(raw: unknown, warnings: string[]): Settings {
   return {
     providers,
     defaultProvider: typeof root.defaultProvider === "string" ? root.defaultProvider : undefined,
+    defaultModel: typeof root.defaultModel === "string" ? root.defaultModel : undefined,
     showThinking: typeof root.showThinking === "boolean" ? root.showThinking : undefined,
     mcp: { servers },
   };

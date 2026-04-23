@@ -9,6 +9,7 @@ import { TeammateManager } from "./teammate-manager.js";
 import { TaskManager } from "./task-manager.js";
 import { SkillLoader } from "./skills/index.js";
 import { handleListMcpResources, handleMcpCall, handleReadMcpResource } from "./mcp/runtime.js";
+import { describeSubagentsForHumans } from "./subagents.js";
 import type { ToolArgs } from "./types.js";
 
 const execAsync = promisify(exec);
@@ -319,13 +320,20 @@ export const TASK_TOOL = {
   type: "function",
   name: "task",
   description:
-    "Dispatch a subtask to an independent sub-agent with a clean context. The sub-agent has all base tools (bash, read_file, write_file, edit_file) but cannot spawn further sub-agents. Use this for isolated, well-defined tasks to keep the main conversation context clean. Returns only the sub-agent's final summary.",
+    `Dispatch a subtask to an independent sub-agent with a clean context. Returns only the sub-agent's final summary.
+Available subagent types:
+${describeSubagentsForHumans()}`,
   parameters: {
     type: "object",
     properties: {
       description: {
         type: "string",
         description: "A clear, self-contained description of the task for the sub-agent to perform.",
+      },
+      subagent_type: {
+        type: "string",
+        enum: ["general-purpose", "explore"],
+        description: "Optional specialized sub-agent type. Omit to use general-purpose.",
       },
     },
     required: ["description"],

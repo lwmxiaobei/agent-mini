@@ -3,6 +3,7 @@ export type ResponseInputItem = Record<string, unknown>;
 export type ChatMessage = Record<string, unknown>;
 
 export type AgentState = {
+  sessionId: string;
   previousResponseId?: string;
   responseHistory: ResponseInputItem[];
   chatHistory: ChatMessage[];
@@ -20,6 +21,15 @@ export type DiffLine = {
 export type UiMessage = {
   id: string;
   kind: "system" | "user" | "assistant" | "tool" | "thinking" | "error";
+  title?: string;
+  subtitle?: string;
+  text: string;
+  diffLines?: DiffLine[];
+  collapsed?: boolean;
+};
+
+export type PersistedUiMessage = {
+  kind: UiMessage["kind"];
   title?: string;
   subtitle?: string;
   text: string;

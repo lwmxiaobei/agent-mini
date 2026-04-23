@@ -4,7 +4,7 @@ import { join } from "path";
 import type { ChatMessage } from "./types.js";
 
 const KEEP_RECENT = 3;
-const TOKEN_THRESHOLD = 50000;
+const TOKEN_THRESHOLD = 500000;
 const TRANSCRIPT_DIR = ".transcripts";
 
 /** Rough token estimate: ~4 chars ≈ 1 token */

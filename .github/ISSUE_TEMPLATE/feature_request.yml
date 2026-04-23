@@ -1,0 +1,34 @@
+name: Feature Request
+description: Suggest an improvement or new capability for xbcode
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please describe the problem and the expected user value clearly.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What limitation or workflow gap are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the solution you want, including commands, workflows, or user interactions when possible.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe any alternative approaches or workarounds you have considered.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add mockups, examples, references, or related issues if helpful.

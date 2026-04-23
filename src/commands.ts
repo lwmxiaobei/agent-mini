@@ -44,6 +44,7 @@ export function normalizeCommand(inputValue: string): string | null {
     case "inbox":
     case "compact":
     case "new":
+    case "resume":
     case "exit":
       return withoutSlash;
     case "provider":
@@ -56,4 +57,32 @@ export function normalizeCommand(inputValue: string): string | null {
     default:
       return null;
   }
+}
+
+export type StartupCommand =
+  | { kind: "default" }
+  | { kind: "resume"; sessionId?: string };
+
+/**
+ * Parse process argv into the minimal startup commands supported by the CLI.
+ *
+ * Why this exists:
+ * - Slash commands run after the TUI mounts, but `xbcode resume <id>` needs to
+ *   restore state before the first render so the user lands directly in that
+ *   session.
+ * - Keeping argv parsing separate from the Ink entrypoint makes the behavior
+ *   testable without booting the full terminal UI.
+ * - The parser stays intentionally tiny: unknown argv falls back to normal
+ *   startup so we do not accidentally turn future positional text into a
+ *   pseudo-command.
+ */
+export function parseStartupCommand(argv: string[]): StartupCommand {
+  const [firstArg, secondArg] = argv.map((value) => value.trim()).filter(Boolean);
+  if (firstArg === "resume") {
+    return {
+      kind: "resume",
+      sessionId: secondArg,
+    };
+  }
+  return { kind: "default" };
 }

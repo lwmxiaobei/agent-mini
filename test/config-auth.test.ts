@@ -7,9 +7,11 @@ import test from "node:test";
 import {
   clearProviderCredentials,
   loadCredentialsFile,
+  needsModelSelection,
   normalizeSettings,
   resolveProviderAuthState,
   resolveRuntimeAuth,
+  shouldPromptForModelSelection,
   writeCredentialsFile,
   writeSettingsFile,
   updateProviderModels,
@@ -126,6 +128,7 @@ test("updateProviderModels persists discovered model ids for one provider", asyn
       },
     },
     defaultProvider: "openai",
+    defaultModel: "gpt-5",
   }, []));
 
   await updateProviderModels(settingsPath, "openai", ["gpt-5", "gpt-5-mini", "gpt-5"]);
@@ -134,4 +137,40 @@ test("updateProviderModels persists discovered model ids for one provider", asyn
   assert.deepEqual(saved.providers.openai.models, ["gpt-5", "gpt-5-mini"]);
   assert.deepEqual(saved.providers.other.models, ["keep-me"]);
   assert.equal(saved.defaultProvider, "openai");
+  assert.equal(saved.defaultModel, "gpt-5");
+});
+
+test("normalizeSettings keeps defaultModel when provided", () => {
+  const settings = normalizeSettings({
+    providers: {
+      openai: {
+        models: ["gpt-5", "gpt-5-mini"],
+      },
+    },
+    defaultProvider: "openai",
+    defaultModel: "gpt-5-mini",
+  }, []);
+
+  assert.equal(settings.defaultProvider, "openai");
+  assert.equal(settings.defaultModel, "gpt-5-mini");
+});
+
+test("shouldPromptForModelSelection skips picker when MODEL_ID is set for the session", () => {
+  assert.equal(shouldPromptForModelSelection({
+    providerName: "openai",
+    model: "gpt-4.1",
+    availableModels: [],
+  }, true), false);
+});
+
+test("shouldPromptForModelSelection still prompts for broken saved defaults without env override", () => {
+  assert.equal(shouldPromptForModelSelection({
+    providerName: "openai",
+    model: "gpt-4.1",
+    availableModels: ["gpt-5", "gpt-5-mini"],
+  }), true);
+});
+
+test("needsModelSelection is exported for startup callers", () => {
+  assert.equal(typeof needsModelSelection, "function");
 });

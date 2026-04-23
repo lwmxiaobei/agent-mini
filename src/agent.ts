@@ -4,10 +4,10 @@ import { microCompact, estimateTokens, autoCompact, TOKEN_THRESHOLD } from "./co
 import { getDynamicMcpToolSurface } from "./mcp/runtime.js";
 import { messageBus, teammateManager, LEAD_NAME, TOOLS, CHAT_TOOLS, BASE_TOOLS, BASE_CHAT_TOOLS, TEAMMATE_TOOLS, TEAMMATE_CHAT_TOOLS, BASE_TOOL_HANDLERS, taskManager } from "./tools.js";
 import { renderInboxPrompt } from "./message-bus.js";
+import { getSubagentDefinition, type SubagentDefinition } from "./subagents.js";
 import type { TeammateRuntimeControl } from "./teammate-manager.js";
 import type { ToolArgs, ResponseInputItem, ChatMessage, AgentState, UiBridge } from "./types.js";
 
-const MAX_SUBAGENT_ROUNDS = 30;
 const NAG_THRESHOLD = 3;
 const NAG_MESSAGE = "<reminder>Update your tasks with task_list or task_update.</reminder>";
 const RESPONSES_COMPACT_INTERVAL = 20;
@@ -52,6 +52,20 @@ function safeJsonParse(value: string): ToolArgs {
   } catch {
     return {};
   }
+}
+
+/**
+ * 为一个 assistant content part 生成稳定 key。
+ *
+ * 为什么要单独建 key：
+ * - Responses 流里同一段文本可能先经历 `content_part.added`，再经历
+ *   `output_text.delta`，最后再来 `output_text.done`。
+ * - 如果不按 output/content 位置追踪已渲染长度，UI 很容易把同一段文本显示
+ *   三遍，尤其是在不同后端混合发送这些事件的时候。
+ * - 这里使用 output/content 下标组合，足以在单次响应内唯一标识一个文本块。
+ */
+function getResponseContentKey(outputIndex: unknown, contentIndex: unknown): string {
+  return `${String(outputIndex ?? "")}:${String(contentIndex ?? "")}`;
 }
 
 /**
@@ -171,6 +185,66 @@ function extractAssistantText(content: unknown): string {
     .join("");
 }
 
+/**
+ * 从 Responses API 的 `output` 里提取 assistant 文本。
+ *
+ * 为什么要单独做这一步：
+ * - UI 实时渲染主要依赖 `response.output_text.delta`，但不同后端并不保证
+ *   一定会把最终文本完整地以 delta 形式流出来。
+ * - 某些响应会在 `finalResponse().output` 里携带完整 message 文本，同时还带
+ *   function_call；如果这里只信任流式 delta，UI 就会出现“只看到工具，没有
+ *   看到模型文字”的问题。
+ * - 这里统一从最终 `output` 兜底提取，确保无论流事件是否完整，assistant
+ *   文本都能被恢复。
+ */
+export function extractAssistantTextFromResponseOutput(output: unknown): string {
+  if (!Array.isArray(output)) {
+    return "";
+  }
+
+  return output
+    .map((item: any) => {
+      if (item?.type === "message" && item?.role === "assistant") {
+        return extractAssistantText(item.content);
+      }
+      if (item?.type === "text") {
+        return extractAssistantText(item.text);
+      }
+      return "";
+    })
+    .join("")
+    .trim();
+}
+
+/**
+ * 计算最终响应里还没有被 UI 显示出来的 assistant 文本增量。
+ *
+ * 为什么不是直接再次整段 push：
+ * - 如果前半段文本已经通过 delta 渲染出来，直接整段补发会导致重复显示。
+ * - 最常见的缺口是“完全没流出来”或“只缺最后一小段”，因此优先走前缀补齐，
+ *   让 UI 尽量保持一条连续 assistant 消息。
+ * - 如果最终文本和已流出的前缀完全对不上，说明后端事件形态和预期差异更大，
+ *   这时返回整段完整文本，至少保证用户能看到模型真实回答。
+ */
+export function getMissingAssistantText(streamedText: string, finalText: string): string {
+  const streamed = streamedText.trim();
+  const finalized = finalText.trim();
+
+  if (!finalized) {
+    return "";
+  }
+  if (!streamed) {
+    return finalized;
+  }
+  if (finalized === streamed) {
+    return "";
+  }
+  if (finalized.startsWith(streamed)) {
+    return finalized.slice(streamed.length);
+  }
+  return finalized;
+}
+
 function repairInterruptedToolCallHistory(history: ChatMessage[]): void {
   if (history.length === 0) {
     return;
@@ -256,6 +330,64 @@ function buildInboxWorkPrompt(): string {
   return "Process the inbox items in order. Use available tools to do the work. Coordinate via message_send when needed.";
 }
 
+// 子代理需要按定义裁剪工具，而不是总是继承整套 BASE_TOOLS。
+// 这样 `task` 才能从“再跑一次 loop”升级成“按角色运行的 worker”，
+// 这是 Claude Code 子代理体系里最核心、也是最值得最小化迁移的部分。
+function selectToolsByName(tools: readonly any[], allowedToolNames: readonly string[]): any[] {
+  const allowed = new Set(allowedToolNames);
+  return tools.filter((tool) => allowed.has(String(tool?.name ?? "")));
+}
+
+// `explore` 这类只读 agent 不能直接复用通用 bash handler，
+// 因为通用 handler 允许执行任意工作区命令。这里做一层显式白名单，
+// 目的是把“只读”从 prompt 约束升级为运行时约束，避免模型失手写文件。
+function isReadOnlyShellCommand(command: string): boolean {
+  const trimmed = command.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  const forbiddenPatterns = [
+    /(^|[\s;&|])(rm|mv|cp|mkdir|touch|chmod|chown)\b/,
+    /(^|[\s;&|])(git\s+(add|commit|checkout|switch|restore|reset|clean|merge|rebase|pull|push))\b/,
+    /(^|[\s;&|])(npm|pnpm|yarn|bun|pip|pip3)\s+(install|add|remove|uninstall)\b/,
+    />/,
+    /\|/,
+  ];
+
+  return !forbiddenPatterns.some((pattern) => pattern.test(trimmed));
+}
+
+// 这里把“工具列表”和“工具执行函数”一起裁剪。
+// 只裁工具定义不裁 handler 会留下越权入口，只裁 handler 不裁 schema 又会误导模型。
+function buildSubagentRuntime(definition: SubagentDefinition): PreparedToolRuntime {
+  const responseTools = selectToolsByName(BASE_TOOLS, definition.allowedTools);
+  const chatTools = selectToolsByName(BASE_CHAT_TOOLS, definition.allowedTools);
+  const handlers: ToolHandlerMap = { ...BASE_TOOL_HANDLERS };
+
+  if (definition.readOnlyShell) {
+    handlers.bash = ({ command }) => {
+      const normalized = String(command ?? "");
+      if (!isReadOnlyShellCommand(normalized)) {
+        return "Error: This sub-agent is read-only. Only non-mutating shell commands are allowed.";
+      }
+      return BASE_TOOL_HANDLERS.bash({ command: normalized });
+    };
+  }
+
+  for (const toolName of Object.keys(handlers)) {
+    if (!definition.allowedTools.includes(toolName)) {
+      delete handlers[toolName];
+    }
+  }
+
+  return {
+    handlers,
+    responseTools,
+    chatTools,
+  };
+}
+
 async function prepareToolRuntime(
   baseHandlers: ToolHandlerMap,
   baseResponseTools: readonly any[],
@@ -309,6 +441,7 @@ async function streamResponse(
   let responseId: string | undefined;
   let assistantText = "";
   const streamedFunctionCalls = new Map<string, any>();
+  const streamedAssistantContent = new Map<string, string>();
 
   /**
    * ChatGPT Codex stream responses are slightly different from the public
@@ -340,7 +473,31 @@ async function streamResponse(
       if (event.type === "response.output_text.delta") {
         const delta = String(event.delta ?? "");
         assistantText += delta;
+        const contentKey = getResponseContentKey(event.output_index, event.content_index);
+        streamedAssistantContent.set(
+          contentKey,
+          `${streamedAssistantContent.get(contentKey) ?? ""}${delta}`,
+        );
         bridge.appendAssistantDelta(delta);
+        continue;
+      }
+
+      /**
+       * 有些 Responses 后端不会先发 `output_text.delta`，而是直接先把一个完整或
+       * 半完整的 output_text part 塞进 `content_part.added/done`。如果不消费这些
+       * 事件，UI 就会出现“只有工具调用，没有 assistant 文本”。
+       */
+      if (event.type === "response.content_part.added" && event.part?.type === "output_text") {
+        const contentKey = getResponseContentKey(event.output_index, event.content_index);
+        const nextText = String(event.part?.text ?? "");
+        const emittedText = streamedAssistantContent.get(contentKey) ?? "";
+        const missingText = nextText.startsWith(emittedText) ? nextText.slice(emittedText.length) : nextText;
+
+        if (missingText) {
+          assistantText += missingText;
+          bridge.appendAssistantDelta(missingText);
+        }
+        streamedAssistantContent.set(contentKey, nextText);
         continue;
       }
 
@@ -375,6 +532,34 @@ async function streamResponse(
         continue;
       }
 
+      if (event.type === "response.content_part.done" && event.part?.type === "output_text") {
+        const contentKey = getResponseContentKey(event.output_index, event.content_index);
+        const nextText = String(event.part?.text ?? "");
+        const emittedText = streamedAssistantContent.get(contentKey) ?? "";
+        const missingText = nextText.startsWith(emittedText) ? nextText.slice(emittedText.length) : nextText;
+
+        if (missingText) {
+          assistantText += missingText;
+          bridge.appendAssistantDelta(missingText);
+        }
+        streamedAssistantContent.set(contentKey, nextText);
+        continue;
+      }
+
+      if (event.type === "response.output_text.done") {
+        const contentKey = getResponseContentKey(event.output_index, event.content_index);
+        const nextText = String(event.text ?? "");
+        const emittedText = streamedAssistantContent.get(contentKey) ?? "";
+        const missingText = nextText.startsWith(emittedText) ? nextText.slice(emittedText.length) : nextText;
+
+        if (missingText) {
+          assistantText += missingText;
+          bridge.appendAssistantDelta(missingText);
+        }
+        streamedAssistantContent.set(contentKey, nextText);
+        continue;
+      }
+
       if (showThinking && ["response.reasoning_summary_text.delta", "response.reasoning_text.delta"].includes(event.type)) {
         bridge.appendThinkingDelta(String(event.delta ?? ""));
         continue;
@@ -382,8 +567,21 @@ async function streamResponse(
     }
 
     const response = await stream.finalResponse();
-    bridge.finalizeStreaming();
     const sdkOutput = Array.isArray(response.output) ? response.output : [];
+    const recoveredAssistantText = extractAssistantTextFromResponseOutput(sdkOutput);
+    const missingAssistantText = getMissingAssistantText(assistantText, recoveredAssistantText);
+
+    /**
+     * 这里必须在 finalize 之前补 UI：
+     * - `appendAssistantDelta()` 依赖当前正在流式渲染的 message id；
+     * - 一旦先 finalize，就只能新建一条 assistant 消息，文本会和前面的片段断开；
+     * - 先补齐缺失尾巴，再 finalize，才能最大程度保留“同一条回答”的连续性。
+     */
+    if (missingAssistantText) {
+      bridge.appendAssistantDelta(missingAssistantText);
+      assistantText = `${assistantText}${missingAssistantText}`;
+    }
+    bridge.finalizeStreaming();
 
     /**
      * Preserve SDK output when present, but patch in a synthetic fallback for
@@ -645,17 +843,22 @@ function buildLeadHandlers(config: AgentConfig, bridge: UiBridge): ToolHandlerMa
   return {
     ...BASE_TOOL_HANDLERS,
     ...buildSharedTeamHandlers(LEAD_NAME),
-    task: async ({ description }) => {
+    task: async ({ description, subagent_type }) => {
       const taskDescription = String(description ?? "");
-      const subSystem = `${config.system}\nYou are a sub-agent handling a specific task. Complete it thoroughly and provide a clear summary of what you did.`;
+      const definition = getSubagentDefinition(typeof subagent_type === "string" ? subagent_type : undefined);
+      const subSystem = `${config.system}\n${definition.systemPrompt}`;
 
-      bridge.pushTool("task", { description: taskDescription }, "launching sub-agent...");
+      bridge.pushTool(
+        "task",
+        { description: taskDescription, subagent_type: definition.name },
+        `launching ${definition.name} sub-agent...`,
+      );
 
       let result: string;
       if (config.apiMode === "chat-completions") {
-        result = await subAgentLoopChatCompletions(config.client, config.model, subSystem, taskDescription, bridge);
+        result = await subAgentLoopChatCompletions(config.client, config.model, subSystem, taskDescription, bridge, definition);
       } else {
-        result = await subAgentLoopResponses(config.client, config.model, subSystem, taskDescription, bridge);
+        result = await subAgentLoopResponses(config.client, config.model, subSystem, taskDescription, bridge, definition);
       }
 
       return result;
@@ -752,15 +955,16 @@ async function subAgentLoopResponses(
   system: string,
   description: string,
   bridge: UiBridge,
+  definition: SubagentDefinition,
 ): Promise<string> {
-  const runtime = await prepareToolRuntime(BASE_TOOL_HANDLERS, BASE_TOOLS, BASE_CHAT_TOOLS);
+  const runtime = buildSubagentRuntime(definition);
   let nextInput: ResponseInputItem[] | string = [
     { role: "user", content: [{ type: "input_text", text: description }] },
   ];
   let currentResponseId: string | undefined;
   let lastText = "";
 
-  for (let round = 0; round < MAX_SUBAGENT_ROUNDS; round += 1) {
+  for (let round = 0; round < definition.maxRounds; round += 1) {
     const response = await streamResponse(client, model, system, false, nextInput, currentResponseId, bridge, runtime.responseTools);
     currentResponseId = response.id;
 
@@ -805,12 +1009,13 @@ async function subAgentLoopChatCompletions(
   system: string,
   description: string,
   bridge: UiBridge,
+  definition: SubagentDefinition,
 ): Promise<string> {
-  const runtime = await prepareToolRuntime(BASE_TOOL_HANDLERS, BASE_TOOLS, BASE_CHAT_TOOLS);
+  const runtime = buildSubagentRuntime(definition);
   const history: ChatMessage[] = [{ role: "user", content: description }];
   let lastText = "";
 
-  for (let round = 0; round < MAX_SUBAGENT_ROUNDS; round += 1) {
+  for (let round = 0; round < definition.maxRounds; round += 1) {
     const message = await streamChatCompletion(client, model, system, history, bridge, runtime.chatTools, false);
 
     const assistantText = extractAssistantText(message.content);
