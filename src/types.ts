@@ -7,6 +7,7 @@ export type AgentState = {
   previousResponseId?: string;
   responseHistory: ResponseInputItem[];
   chatHistory: ChatMessage[];
+  pendingCompactedContext?: string;
   turnCount: number;
   launchedAt: number;
   roundsSinceTask: number;
@@ -37,10 +38,18 @@ export type PersistedUiMessage = {
   collapsed?: boolean;
 };
 
+export type TokenUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+  cost: number;
+};
+
 export type UiBridge = {
   appendAssistantDelta(delta: string): void;
   appendThinkingDelta(delta: string): void;
   finalizeStreaming(): void;
   pushAssistant(text: string): void;
   pushTool(name: string, args: ToolArgs, result: string): void;
+  updateUsage(usage: TokenUsage): void;
 };

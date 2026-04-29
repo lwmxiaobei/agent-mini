@@ -21,8 +21,11 @@ test("buildSystemPrompt appends AGENTS.md contents with source label when presen
     mcpInstructions: "No MCP servers configured.",
   });
 
-  assert.match(prompt, /You are a coding agent at /);
-  assert.match(prompt, /Skills available:\nreview: Review changes/);
+  assert.match(prompt, /You are a coding agent/);
+  assert.match(prompt, /# Skills available\n/);
+  assert.match(prompt, /review: Review changes/);
+  assert.match(prompt, /# Environment/);
+  assert.match(prompt, new RegExp(`Primary working directory: ${root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   assert.match(
     prompt,
     new RegExp(`Project instructions from ${agentsPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:`),

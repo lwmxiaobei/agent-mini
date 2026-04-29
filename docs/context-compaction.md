@@ -63,20 +63,21 @@ Math.ceil(JSON.stringify(messages).length / 4)
 
 ### 2.3 `autoCompact(client, model, messages)`
 
-这是第二层压缩，目标是用模型生成摘要，然后用摘要替换整段历史。
+这是第二层压缩，目标是用模型生成旧前缀摘要，并保留最近一段原文历史。
 
 执行步骤：
 
 1. 先把完整历史落盘到 `.transcripts/transcript_<timestamp>.jsonl`。
-2. 把整段 `messages` 做 `JSON.stringify`。
-3. 只截取前 `80000` 个字符作为待总结输入。
+2. 按“最近用户消息边界”把历史拆成“旧前缀 + 最近原文后缀”。
+3. 只把旧前缀做 `JSON.stringify` 后送去总结，并保留字符上限保护。
 4. 调用 `client.chat.completions.create(...)` 生成摘要。
-5. 用两条新消息替换旧历史：
+5. 用“压缩摘要 + assistant 承接消息 + 最近原文后缀”替换旧历史：
 
 ```ts
 [
-  { role: "user", content: "[Compressed conversation history]\\n\\n<summary>" },
-  { role: "assistant", content: "Understood. I have the context from our previous conversation. Continuing." }
+  { role: "user", content: "[Compressed conversation history]\\n\\n<summary>\\n\\nFull transcript saved at: ..." },
+  { role: "assistant", content: "Understood. I will continue from the preserved recent context." },
+  ...recentMessages
 ]
 ```
 
@@ -91,9 +92,8 @@ Math.ceil(JSON.stringify(messages).length / 4)
 注意几个关键点：
 
 - 这里固定使用 `chat.completions.create` 做摘要，不走 Responses API。
-- 输入历史被截断到前 `80000` 个字符，不是“尽量保留最近消息”，而是单纯从头截断。
 - 摘要最大输出是 `2000` tokens。
-- 压缩后的历史只剩 2 条消息。
+- 最近若干条消息会按用户消息边界保留原文，降低压缩后的任务漂移。
 
 ## 3. Chat Completions 模式下的压缩流程
 
@@ -151,19 +151,19 @@ estimateTokens(history) > TOKEN_THRESHOLD
 
 压缩发生后：
 
-- 原始 `chatHistory` 被整体清空。
-- 只保留“压缩摘要 + assistant 确认”两条消息。
+- 原始 `chatHistory` 不再整体清空。
+- 旧前缀被压缩成摘要，最近消息保留原文。
 - `state.compactCount += 1`
 
 这意味着：
 
-- 旧的精细上下文会丢失，只剩摘要。
+- 较早的精细上下文会丢失，只剩摘要。
 - tool 输出原文、推理细节、逐步交互顺序都无法恢复。
 - 但完整历史已经提前写入 `.transcripts/`，可用于离线追溯。
 
 ## 4. Responses API 模式下的“压缩”流程
 
-这里需要特别区分：它没有对消息做摘要压缩。
+这里需要特别区分：它现在会先在本地 `responseHistory` 上生成压缩摘要，再重置远端链路。
 
 `responses` 模式下，项目不维护 `chatHistory` 作为主上下文，而是依赖：
 
@@ -200,12 +200,12 @@ state.turnCount > 1 && (state.turnCount - 1) % RESPONSES_COMPACT_INTERVAL === 0
 就会：
 
 1. 在 UI 中提示 `Compacting Responses API context chain...`
-2. 把 `state.previousResponseId = undefined`
-3. `state.compactCount += 1`
+2. 对本地 `responseHistory` 执行“摘要旧前缀 + 保留最近原文后缀”
+3. 保存 transcript
+4. 把 `state.previousResponseId = undefined`
+5. `state.compactCount += 1`
 
-这不生成摘要，不保存 transcript，也不把旧上下文转换成压缩文本。
-
-它只是让下一轮请求不再接到旧 response chain 上，相当于“重开一个上下文链”。
+对于支持 `previous_response_id` 的 stateful provider，下一轮还会把 compact continuity 文本主动拼进首条用户输入，避免切链后完全丢失上下文。
 
 ### 4.3 这种设计的含义
 
@@ -217,7 +217,7 @@ state.turnCount > 1 && (state.turnCount - 1) % RESPONSES_COMPACT_INTERVAL === 0
 
 代价：
 
-- 到第 21、41、61... 轮时，上下文会被直接切断。
+- 到第 21、41、61... 轮时，远端上下文链仍会被切断。
 - 切断后模型拿不到任何摘要化延续信息。
 - 从连续性角度看，这更像“定期清空上下文”，不是“压缩上下文”。
 

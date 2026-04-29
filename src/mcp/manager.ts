@@ -185,20 +185,7 @@ export class McpManager {
       lines.push("(no enabled MCP servers)");
     } else {
       for (const state of states) {
-        const supportedKinds = this.getSupportedKinds(state);
-        const capabilities = supportedKinds.join(", ") || "none";
         lines.push(`- ${state.name} [${state.status}] ${state.transport}`);
-        lines.push(`  capabilities: ${capabilities}`);
-
-        if (state.cache.tools.length === 0) {
-          lines.push("  tools: (none discovered)");
-        } else {
-          lines.push(`  tools (${state.cache.tools.length}):`);
-          for (const tool of state.cache.tools) {
-            lines.push(`    - ${tool.name}`);
-          }
-        }
-
         if (state.error) {
           lines.push(`  error: ${ellipsize(state.error, 240)}`);
         }

@@ -59,6 +59,39 @@ export function normalizeCommand(inputValue: string): string | null {
   }
 }
 
+/**
+ * Decide whether a given submission would start an agent turn and therefore
+ * requires the user to have explicitly selected a model first.
+ *
+ * Why this exists:
+ * - The CLI can intentionally enter the main UI without a chosen model when
+ *   the picker is dismissed, but plain chat input must still be blocked.
+ * - Built-in commands such as `/help`, `/model`, or `/resume` should continue
+ *   to work because they do not directly open a model-backed turn.
+ * - Skill slash commands are special: they are slash-prefixed, but they do run
+ *   an agent turn, so the caller passes that knowledge explicitly.
+ */
+export function submissionNeedsSelectedModel(inputValue: string, isSkillSlashInvocation = false): boolean {
+  const trimmed = inputValue.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  if (["q", "exit"].includes(trimmed.toLowerCase())) {
+    return false;
+  }
+
+  if (normalizeCommand(trimmed)) {
+    return false;
+  }
+
+  if (isSkillSlashInvocation) {
+    return true;
+  }
+
+  return !trimmed.startsWith("/");
+}
+
 export type StartupCommand =
   | { kind: "default" }
   | { kind: "resume"; sessionId?: string };

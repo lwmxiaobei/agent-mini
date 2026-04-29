@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { normalizeCommand, parseStartupCommand } from "../src/commands.js";
+import { normalizeCommand, parseStartupCommand, submissionNeedsSelectedModel } from "../src/commands.js";
 
 test("normalizeCommand keeps built-in commands that carry trailing arguments", () => {
   assert.equal(normalizeCommand("/provider openai"), "provider openai");
@@ -40,4 +40,13 @@ test("parseStartupCommand recognizes resume invocations from argv", () => {
 test("parseStartupCommand falls back to default for unknown argv", () => {
   assert.deepEqual(parseStartupCommand([]), { kind: "default" });
   assert.deepEqual(parseStartupCommand(["hello"]), { kind: "default" });
+});
+
+test("submissionNeedsSelectedModel only flags inputs that would start a turn", () => {
+  assert.equal(submissionNeedsSelectedModel("hello"), true);
+  assert.equal(submissionNeedsSelectedModel("/help"), false);
+  assert.equal(submissionNeedsSelectedModel("/model"), false);
+  assert.equal(submissionNeedsSelectedModel("/resume 20260422-abcd12"), false);
+  assert.equal(submissionNeedsSelectedModel("/unknown"), false);
+  assert.equal(submissionNeedsSelectedModel("/skill foo", true), true);
 });

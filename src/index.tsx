@@ -3,11 +3,10 @@
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { EventEmitter } from "node:events";
 
 import { config as loadDotenv } from "dotenv";
 import fs from "node:fs";
-import { Box, Newline, Text, render, useApp, useInput, useStdin } from "ink";
+import { Box, Newline, Static, Text, render, useApp, useInput } from "ink";
 import TextInput from "ink-text-input";
 import { Marked } from "marked";
 import { markedTerminal } from "marked-terminal";
@@ -38,8 +37,8 @@ import {
   type ResolvedConfig,
   type StoredOAuthCredentials,
 } from "./config.js";
-import { estimateTokens, autoCompact } from "./compact.js";
-import { normalizeCommand, parseStartupCommand } from "./commands.js";
+import { estimateTokens, autoCompact, autoCompactResponseHistory } from "./compact.js";
+import { normalizeCommand, parseStartupCommand, submissionNeedsSelectedModel } from "./commands.js";
 import { createSubmitDeduper, getSubmittedValueFromInput } from "./input-submit.js";
 import { formatMailboxMessages, renderInboxPrompt } from "./message-bus.js";
 import { ensureMcpInitialized, getMcpPromptInstructions, mcpManager, primeMcpRuntime, refreshMcpFromSettings } from "./mcp/runtime.js";
@@ -54,7 +53,7 @@ import {
 import { buildSystemPrompt } from "./prompt.js";
 import { appendSessionCheckpoint, createSessionId, listRecentSessions, loadSession, type SessionSnapshot } from "./session-store.js";
 import { skillLoader, messageBus, teammateManager } from "./tools.js";
-import type { AgentState, DiffLine, PersistedUiMessage, UiBridge, UiMessage } from "./types.js";
+import type { AgentState, DiffLine, PersistedUiMessage, TokenUsage, UiBridge, UiMessage } from "./types.js";
 import { ellipsize } from "./utils.js";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -224,14 +223,12 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { command: "/inbox", description: "drain lead inbox" },
   { command: "/provider", description: "switch provider" },
   { command: "/model", description: "switch model within current provider" },
-  { command: "/mouse", description: "toggle mouse wheel capture mode" },
   { command: "/compact", description: "compact conversation history to free context space" },
   { command: "/new", description: "clear context and start a new conversation" },
   { command: "/resume", description: "list recent saved sessions or restore one by id" },
   { command: "/exit", description: "exit the CLI" },
 ];
 
-const MOUSE_INPUT_SEQUENCE_RE = /^\u001b\[<(\d+);(\d+);(\d+)([Mm])$/;
 
 function getSkillSlashCommands(): SlashCommand[] {
   const limit = 30;
@@ -277,22 +274,10 @@ function toolPreview(value: string, maxLength = 400): string {
   return ellipsize(value.replaceAll(/\s+/g, " ").trim(), maxLength);
 }
 
-function parseMouseInputSequence(input: string): { kind: "wheel"; delta: number } | { kind: "other" } | null {
-  const match = MOUSE_INPUT_SEQUENCE_RE.exec(input);
-  if (!match) {
-    return null;
-  }
-
-  const code = Number(match[1]);
-  if ((code & 64) === 64) {
-    return { kind: "wheel", delta: (code & 1) === 0 ? 3 : -3 };
-  }
-
-  return { kind: "other" };
-}
-
-function mouseWheelStatusLabel(enabled: boolean): string {
-  return enabled ? "wheel capture on" : "copy mode";
+function formatNum(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
 }
 
 type ToolDisplay = {
@@ -610,14 +595,18 @@ function WelcomePanel({ width, messages }: { width: number; messages: UiMessage[
   );
 }
 
-function StatusBar({ width, busy, state, scrollOffset }: { width: number; busy: boolean; state: AgentState; scrollOffset: number }) {
+function StatusBar({ width, busy, state, tokenUsage }: { width: number; busy: boolean; state: AgentState; tokenUsage: TokenUsage }) {
   const left = currentResolved
     ? `[${currentResolved.providerName}] ${currentResolved.model}`
     : "[no-model]";
   const mid = `${state.turnCount} turns`;
-  const right = busy ? "working · Esc to stop" : `~${estimateTokens(state.chatHistory)} token`;
-  const history = scrollOffset > 0 ? ` | history ↑${scrollOffset}` : "";
-  const text = `${left} | ${mid} | ${right}${history}`;
+  const totalTokens = tokenUsage.inputTokens + tokenUsage.outputTokens;
+  const right = busy
+    ? "working · Esc to stop"
+    : (totalTokens > 0
+      ? `${formatNum(tokenUsage.inputTokens)}→ ${formatNum(tokenUsage.outputTokens)}↗ ${tokenUsage.cost.toFixed(4)}`
+      : `~${estimateTokens(state.chatHistory)} token`);
+  const text = `${left} | ${mid} | ${right}`;
 
   return (
     <Text color="gray" wrap="truncate">
@@ -641,7 +630,6 @@ function helpMessage(): string {
     "inbox               drain lead inbox",
     "provider [name]     switch provider (no arg = list providers)",
     "model [name]        switch model within current provider",
-    "mouse [on|off]      toggle mouse wheel capture; off restores drag-to-copy",
     "compact             compact conversation history to free context space",
     "new                 clear context and start a new conversation",
     "resume [sessionId]  list recent sessions or restore one",
@@ -652,13 +640,12 @@ function helpMessage(): string {
     `providers  ${providerList}`,
     "",
     "Press Esc while working to stop the current turn without clearing session context.",
-    "Use PgUp/PgDn/Home/End to browse message history.",
     "Slash variants also work, for example /help and /exit.",
     "Anything else is sent directly to the model.",
   ].join("\n");
 }
 
-function sessionStatus(state: AgentState): string {
+function sessionStatus(state: AgentState, tokenUsage?: TokenUsage): string {
   const mcpSummary = mcpManager.getStatusSummary();
   const modelsLine = currentResolved.availableModels.length > 0
     ? `models   ${currentResolved.availableModels.join(", ")}`
@@ -676,6 +663,9 @@ function sessionStatus(state: AgentState): string {
     `session  ${state.sessionId}`,
     `turns    ${state.turnCount}`,
     `context  ~${estimateActiveContextTokens(state)} tokens | compacted: ${state.compactCount} times`,
+    tokenUsage && tokenUsage.inputTokens + tokenUsage.outputTokens > 0
+      ? `tokens   ${formatNum(tokenUsage.inputTokens)} in → ${formatNum(tokenUsage.outputTokens)} out  ${tokenUsage.cost.toFixed(4)}`
+      : `tokens   ~${estimateTokens(state.chatHistory)} (estimated)`,
     `mcp      ${mcpSummary.connected} connected | ${mcpSummary.degraded} degraded | ${mcpSummary.disconnected} disconnected | ${mcpSummary.enabled} enabled`,
     `team     ${teammateManager.listMembers().length} teammates | lead inbox: ${messageBus.inboxSize("lead")}`,
     `uptime   ${formatDuration(Date.now() - state.launchedAt)}`,
@@ -980,50 +970,23 @@ function buildMessageRows(message: UiMessage, width: number): ViewportRow[] {
   }));
 }
 
-function buildViewportRows(messages: UiMessage[], width: number): ViewportRow[] {
-  const rows: ViewportRow[] = [];
-
-  messages.forEach((message, index) => {
-    rows.push(...buildMessageRows(message, width));
-    if (index < messages.length - 1) {
-      rows.push({
-        id: `${message.id}-spacer`,
-        prefix: "  ",
-        text: " ",
-      });
-    }
-  });
-
-  return rows;
-}
-
-function selectVisibleRows(rows: ViewportRow[], availableLines: number, scrollOffset: number): {
-  rows: ViewportRow[];
-  maxScrollOffset: number;
-  effectiveScrollOffset: number;
-} {
-  if (availableLines <= 0) {
-    return { rows: [], maxScrollOffset: 0, effectiveScrollOffset: 0 };
-  }
-
-  const maxScrollOffset = Math.max(0, rows.length - availableLines);
-  const effectiveScrollOffset = Math.max(0, Math.min(maxScrollOffset, scrollOffset));
-  const endExclusive = rows.length - effectiveScrollOffset;
-  const start = Math.max(0, endExclusive - availableLines);
-
-  return {
-    rows: rows.slice(start, endExclusive),
-    maxScrollOffset,
-    effectiveScrollOffset,
-  };
-}
-
 function ViewportRowView({ row }: { row: ViewportRow }) {
   return (
     <Text wrap="truncate-end" color={row.color} dimColor={row.dimColor}>
       <Text color={row.prefixColor}>{row.prefix}</Text>
       {row.text}
     </Text>
+  );
+}
+
+function MessageBlock({ message, width }: { message: UiMessage; width: number }) {
+  const rows = buildMessageRows(message, width);
+  return (
+    <Box flexDirection="column" marginBottom={1}>
+      {rows.map((row) => (
+        <ViewportRowView key={row.id} row={row} />
+      ))}
+    </Box>
   );
 }
 
@@ -1094,7 +1057,6 @@ function ModelSelectPrompt({ choices, selectedIndex, activeModelId }: ModelSelec
 
 function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
   const { exit } = useApp();
-  const { internal_eventEmitter } = useStdin();
   const initialRestoredMessages = startupResume.snapshot ? restoreMessages(startupResume.snapshot.messages) : [];
   const initialMessages = [
     headerItem(),
@@ -1105,7 +1067,6 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
   const messagesRef = useRef<UiMessage[]>([]);
   const [inputValue, setInputValue] = useState("");
   const [busy, setBusy] = useState(false);
-  const [mouseWheelEnabled, setMouseWheelEnabled] = useState(false);
   const [trusted, setTrusted] = useState<boolean | null>(null);
   /**
    * Startup can begin with a fully resolved model when either:
@@ -1126,7 +1087,7 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
   const [trustSelection, setTrustSelection] = useState(0);
   const [modelSelectionIndex, setModelSelectionIndex] = useState(0);
   const [slashSelection, setSlashSelection] = useState(0);
-  const [scrollOffset, setScrollOffset] = useState(0);
+  const [streamingId, setStreamingId] = useState<string | undefined>(undefined);
   const modelChoices = useRef(buildModelChoices());
   const [terminalSize, setTerminalSize] = useState({
     columns: process.stdout.columns ?? 80,
@@ -1135,6 +1096,7 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
 
   const messageCounterRef = useRef(initialRestoredMessages.length + (startupResume.startupMessage ? 1 : 0));
   const [sessionKey, setSessionKey] = useState(0);
+  const [totalTokenUsage, setTotalTokenUsage] = useState<TokenUsage>({ inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cost: 0 });
   const assistantMessageIdRef = useRef<string | undefined>(undefined);
   const thinkingMessageIdRef = useRef<string | undefined>(undefined);
   const skipSubmitRef = useRef(false);
@@ -1143,8 +1105,6 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
   const activeTurnAbortRef = useRef<AbortController | null>(null);
   const stopRequestedRef = useRef(false);
   const startupMcpReportShownRef = useRef(false);
-  const maxScrollOffsetRef = useRef(0);
-  const pageScrollSizeRef = useRef(10);
   const agentStateRef = useRef<AgentState>({
     ...(startupResume.snapshot?.state ?? {
       sessionId: createSessionId(),
@@ -1188,17 +1148,6 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
     setImmediate(() => {
       process.exit(0);
     });
-  };
-
-  const clampScrollOffset = (value: number): number => Math.max(0, Math.min(maxScrollOffsetRef.current, value));
-  const scrollHistoryBy = (delta: number) => {
-    setScrollOffset((current) => clampScrollOffset(current + delta));
-  };
-  const scrollHistoryToLatest = () => {
-    setScrollOffset(0);
-  };
-  const scrollHistoryToOldest = () => {
-    setScrollOffset(maxScrollOffsetRef.current);
   };
 
   useEffect(() => {
@@ -1254,6 +1203,7 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
       if (!ref.current) {
         messageCounterRef.current += 1;
         ref.current = `message-${messageCounterRef.current}`;
+        setStreamingId(ref.current);
         const next = [...current, { id: ref.current, kind, title, text: delta }];
         messagesRef.current = next;
         return next;
@@ -1268,6 +1218,7 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
   const finalizeStreaming = () => {
     assistantMessageIdRef.current = undefined;
     thinkingMessageIdRef.current = undefined;
+    setStreamingId(undefined);
   };
 
   const bridge: UiBridge = {
@@ -1308,12 +1259,15 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
         pushMessage("tool", `args  ${toolPreview(JSON.stringify(args))}\nresult  ${toolPreview(result)}`, `tool ${name}`);
       }
     },
+    updateUsage(usage: TokenUsage) {
+      setTotalTokenUsage(usage);
+    },
   };
 
   const resetConversation = (snapshot?: SessionSnapshot) => {
     assistantMessageIdRef.current = undefined;
     thinkingMessageIdRef.current = undefined;
-    scrollHistoryToLatest();
+    setStreamingId(undefined);
     agentStateRef.current = snapshot?.state ?? {
       sessionId: createSessionId(),
       responseHistory: [],
@@ -1351,7 +1305,6 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
       if (!currentResolved) ensureConfig();
       setUserHasChosenModel(true);
       primeMcpRuntime();
-      scrollHistoryToLatest();
       if (messagesRef.current.length === 0) {
         messagesRef.current = [headerItem()];
         setMessages(messagesRef.current);
@@ -1368,7 +1321,6 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
     setModelSelected(true);
     setUserHasChosenModel(true);
     primeMcpRuntime();
-    scrollHistoryToLatest();
     if (isInitialSelection && messagesRef.current.length <= 1) {
       messagesRef.current = [headerItem()];
       setMessages(messagesRef.current);
@@ -1429,9 +1381,15 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
 
     const command = normalizeCommand(trimmed);
     const skillSlashInvocation = command ? null : parseSkillSlashInvocation(trimmed);
+    const hasSelectedModel = userHasChosenModel && Boolean(currentResolved);
 
     if (["q", "exit"].includes(trimmed.toLowerCase()) || command === "exit") {
       requestExit();
+      return;
+    }
+
+    if (!hasSelectedModel && submissionNeedsSelectedModel(trimmed, Boolean(skillSlashInvocation))) {
+      pushMessage("error", "No model selected. Use /model to select one.", "model");
       return;
     }
 
@@ -1444,7 +1402,7 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
       if (command === "status") {
         await ensureMcpInitialized();
         await refreshCurrentAuth();
-        pushMessage("system", sessionStatus(agentStateRef.current), "status");
+        pushMessage("system", sessionStatus(agentStateRef.current, totalTokenUsage), "status");
         return;
       }
 
@@ -1538,15 +1496,28 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
           pushMessage("system", "Compacting conversation history...", "compact");
           const compacted = await autoCompact(agentConfig.client, agentConfig.model, state.chatHistory);
           state.chatHistory.length = 0;
-          state.chatHistory.push(...compacted);
+          state.chatHistory.push(...compacted.messages);
           state.compactCount += 1;
           const after = estimateTokens(state.chatHistory);
           pushMessage("system", `Compacted: ~${before} → ~${after} tokens`, "compact");
         } else {
+          const before = estimateTokens(state.responseHistory as any);
+          if (state.responseHistory.length > 0) {
+            pushMessage("system", "Compacting Responses API context chain...", "compact");
+            const compacted = await autoCompactResponseHistory(
+              agentConfig.client,
+              agentConfig.model,
+              state.responseHistory,
+            );
+            state.responseHistory = compacted.messages;
+            state.pendingCompactedContext = agentConfig.supportsPreviousResponseId
+              ? compacted.continuationMessage
+              : undefined;
+          }
           state.previousResponseId = undefined;
-          state.responseHistory = [];
           state.compactCount += 1;
-          pushMessage("system", "Responses API context chain reset.", "compact");
+          const after = estimateTokens(state.responseHistory as any);
+          pushMessage("system", `Responses context compacted: ~${before} → ~${after} tokens`, "compact");
         }
         return;
       }
@@ -1607,35 +1578,6 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
         ensureConfig(match.provider, match.modelId);
         setUserHasChosenModel(true);
         pushMessage("system", `Switched to model "${match.displayName}" (provider: ${match.provider})`, "model");
-        return;
-      }
-
-      if (command.startsWith("mouse")) {
-        const mouseArg = command.slice(5).trim().toLowerCase();
-        let nextValue: boolean;
-
-        if (!mouseArg) {
-          nextValue = !mouseWheelEnabled;
-        } else if (["on", "enable", "enabled"].includes(mouseArg)) {
-          nextValue = true;
-        } else if (["off", "disable", "disabled"].includes(mouseArg)) {
-          nextValue = false;
-        } else if (["status", "state"].includes(mouseArg)) {
-          pushMessage("system", `Mouse mode: ${mouseWheelStatusLabel(mouseWheelEnabled)}.`, "mouse");
-          return;
-        } else {
-          pushMessage("error", 'Usage: /mouse [on|off|status]', "mouse");
-          return;
-        }
-
-        setMouseWheelEnabled(nextValue);
-        pushMessage(
-          "system",
-          nextValue
-            ? "Mouse wheel capture enabled. Terminal drag-to-copy may stop working."
-            : "Mouse wheel capture disabled. Terminal drag-to-copy is restored.",
-          "mouse",
-        );
         return;
       }
 
@@ -1733,7 +1675,6 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
     if (trimmed.startsWith("/")) {
       if (skillSlashInvocation) {
         pushMessage("user", trimmed);
-        scrollHistoryToLatest();
         setBusy(true);
         stopRequestedRef.current = false;
         const abortController = new AbortController();
@@ -1774,7 +1715,6 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
     }
 
     pushMessage("user", trimmed);
-    scrollHistoryToLatest();
     setBusy(true);
     stopRequestedRef.current = false;
     const abortController = new AbortController();
@@ -1844,7 +1784,6 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
       if (key.escape) {
         setModelSelected(true);
         if (!currentResolved) ensureConfig();
-        scrollHistoryToLatest();
         messagesRef.current = [headerItem()];
         setMessages(messagesRef.current);
         return;
@@ -1852,35 +1791,7 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
       return;
     }
 
-    if (key.pageUp) {
-      scrollHistoryBy(pageScrollSizeRef.current);
-      return;
-    }
-
-    if (key.pageDown) {
-      scrollHistoryBy(-pageScrollSizeRef.current);
-      return;
-    }
-
-    if (key.home && (busy || inputValue.length === 0)) {
-      scrollHistoryToOldest();
-      return;
-    }
-
-    if (key.end && (busy || inputValue.length === 0)) {
-      scrollHistoryToLatest();
-      return;
-    }
-
     if (busy) {
-      if (key.upArrow || input === "k") {
-        scrollHistoryBy(1);
-        return;
-      }
-      if (key.downArrow || input === "j") {
-        scrollHistoryBy(-1);
-        return;
-      }
       if (key.escape) {
         requestActiveTurnStop();
       }
@@ -1915,18 +1826,6 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
       }
     }
 
-    if (inputValue.length === 0) {
-      if (key.upArrow || input === "k") {
-        scrollHistoryBy(1);
-        return;
-      }
-
-      if (key.downArrow || input === "j") {
-        scrollHistoryBy(-1);
-        return;
-      }
-    }
-
   });
 
   const handleSubmit = (value: string) => {
@@ -1954,60 +1853,19 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
 
   const innerWidth = Math.max(0, Math.min(terminalSize.columns - 2, 110));
 
-  const allChatMessages = messages.filter((m) => m.id !== "header");
-  const viewportRows = buildViewportRows(allChatMessages, innerWidth);
-
   // Determine which overlay to show (trust / model selection / none)
   const showTrustPrompt = trusted === null;
   const showModelSelect = !showTrustPrompt && !modelSelected;
   const showMainUi = !showTrustPrompt && modelSelected;
-  const slashMenuLines = showSlashMenu
-    ? visibleSlashMenu.items.length + (visibleSlashMenu.hiddenAbove > 0 ? 1 : 0) + (visibleSlashMenu.hiddenBelow > 0 ? 1 : 0)
-    : 0;
-  const reservedLines = 18 + (busy ? 1 : 0) + slashMenuLines;
-  const availableMessageLines = Math.max(1, terminalSize.rows - reservedLines);
-  const { rows: visibleRows, maxScrollOffset, effectiveScrollOffset } = selectVisibleRows(viewportRows, availableMessageLines, scrollOffset);
 
-  maxScrollOffsetRef.current = maxScrollOffset;
-  pageScrollSizeRef.current = Math.max(1, availableMessageLines - 2);
-
-  useEffect(() => {
-    setScrollOffset((current) => clampScrollOffset(current));
-  }, [maxScrollOffset]);
-
-  useEffect(() => {
-    if (!showMainUi || !process.stdout.isTTY || !mouseWheelEnabled) {
-      return;
-    }
-
-    /**
-     * Ink 不提供滚轮事件，所以这里直接拦 stdin 的 SGR 鼠标序列。
-     * 仅消费 wheel，其他鼠标事件继续交给 Ink，避免把点击语义混进滚动逻辑。
-     */
-    const emitter = internal_eventEmitter as EventEmitter;
-    const originalEmit = emitter.emit.bind(emitter);
-    const patchedEmit: EventEmitter["emit"] = ((eventName: string | symbol, ...args: unknown[]) => {
-      if (eventName === "input" && typeof args[0] === "string") {
-        const mouseInput = parseMouseInputSequence(args[0]);
-        if (mouseInput) {
-          if (mouseInput.kind === "wheel") {
-            setScrollOffset((current) => clampScrollOffset(current + mouseInput.delta));
-          }
-          return false;
-        }
-      }
-
-      return originalEmit(eventName, ...args);
-    }) as EventEmitter["emit"];
-
-    emitter.emit = patchedEmit;
-    process.stdout.write("\x1b[?1000h\x1b[?1006h\x1b[?1007h");
-
-    return () => {
-      emitter.emit = originalEmit;
-      process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?1007l");
-    };
-  }, [internal_eventEmitter, mouseWheelEnabled, showMainUi]);
+  /**
+   * 历史消息交给 Ink 的 <Static> 输出到终端 scrollback，
+   * 进入滚动缓冲区后即可由终端原生支持鼠标滚轮与拖动复制。
+   * 流式中的消息不放进 static（delta 会频繁变动），而是在底部动态区渲染，
+   * 流式结束后 streamingId 变为 undefined，该消息自动归入 static 列表。
+   */
+  const liveMessage = streamingId ? messages.find((m) => m.id === streamingId) : undefined;
+  const staticMessages = streamingId ? messages.filter((m) => m.id !== streamingId) : messages;
 
   useEffect(() => {
     if (trusted !== true || !modelSelected || !currentResolved || startupMcpReportShownRef.current) {
@@ -2038,7 +1896,7 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
   }, [trusted, modelSelected, userHasChosenModel]);
 
   return (
-    <Box key={`session-${sessionKey}`} flexDirection="column" paddingX={1} height={terminalSize.rows}>
+    <Box key={`session-${sessionKey}`} flexDirection="column" paddingX={1}>
       {/* Trust prompt overlay */}
       {showTrustPrompt ? (
         <>
@@ -2060,19 +1918,26 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
       {/* Main chat UI */}
       {showMainUi ? (
         <>
-          <WelcomePanel width={innerWidth} messages={messages} />
+          {/**
+           * Static 把历史消息一次性 flush 到 stdout，内容进入终端 scrollback。
+           * 用户即可通过鼠标滚轮滚动（由终端原生处理）、拖动选中复制文本。
+           * 首项是 header，用 WelcomePanel 渲染。
+           */}
+          <Static items={staticMessages}>
+            {(item) => (
+              item.id === "header"
+                ? <WelcomePanel key={item.id} width={innerWidth} messages={messages} />
+                : <MessageBlock key={item.id} message={item} width={innerWidth} />
+            )}
+          </Static>
 
-          <Box flexDirection="column">
-            {visibleRows.map((row) => (
-              <ViewportRowView key={row.id} row={row} />
-            ))}
-          </Box>
+          {/* 流式中的消息：频繁追加 delta，留在动态区实时重绘 */}
+          {liveMessage ? <MessageBlock message={liveMessage} width={innerWidth} /> : null}
 
           <Box flexDirection="column" width="100%" flexShrink={0}>
             <Text color="white" wrap="truncate">{borderRule(innerWidth)}</Text>
-            <StatusBar width={innerWidth} busy={busy} state={agentStateRef.current} scrollOffset={effectiveScrollOffset} />
-            {busy ? <Text color="gray">Working... Esc stops this turn. PgUp/PgDn/Home/End browse history.</Text> : null}
-            {!busy ? <Text color="gray">Mouse: {mouseWheelStatusLabel(mouseWheelEnabled)}. Use /mouse on or /mouse off.</Text> : null}
+            <StatusBar width={innerWidth} busy={busy} state={agentStateRef.current} tokenUsage={totalTokenUsage} />
+            {busy ? <Text color="gray">Working... Esc stops this turn.</Text> : null}
             <Box width="100%" flexDirection="row">
               <Box width={2} flexShrink={0}>
                 <Text>› </Text>

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import { MessageBus, formatMailboxMessages } from "./message-bus.js";
@@ -13,6 +13,8 @@ import { describeSubagentsForHumans } from "./subagents.js";
 import type { ToolArgs } from "./types.js";
 
 const execAsync = promisify(exec);
+// execFile 不走 shell，把参数以数组形式传给进程，正则 pattern 里的特殊字符不会被 shell 二次解析。
+const execFileAsync = promisify(execFile);
 const WORKDIR = process.cwd();
 export const LEAD_NAME = "lead" as const;
 export const TEAM_DIR = path.join(WORKDIR, ".team");
@@ -54,11 +56,115 @@ function toExecError(error: unknown): { stdout?: string; stderr?: string } {
   return {};
 }
 
-// bash 工具是最底层的兜底能力，因此要显式拦截极其危险的命令片段。
+// bash 工具是最底层的兜底能力，因此要显式拦截极其危险的命令。
+//
+// 旧版用 `command.includes("rm -rf /")` 这种子串匹配，多个空格、前缀混淆
+// 都能轻易绕过，且无法表达「rm -rf node_modules 放行 / rm -rf / 拦截」这种
+// 上下文相关的策略。这里改成「先归一化空白 + 一组带原因的正则」的形式，
+// 命中即返回具体原因，模型据此可以转告人类或自行调整。
+type DangerousCommandPattern = {
+  readonly pattern: RegExp;
+  readonly reason: string;
+};
+
+// 命令分隔符或行首，作为大多数模式的左边界；防止 `pseudo` 误伤 `sudo` 之类的子串匹配。
+const COMMAND_BOUNDARY = "(?:^|[\\s;&|`(])";
+
+const DANGEROUS_COMMAND_PATTERNS: readonly DangerousCommandPattern[] = [
+  // 删除根 / 系统目录 / 家目录 / 裸通配符。工作区里的 rm -rf node_modules、./dist 不命中。
+  {
+    pattern: new RegExp(
+      `${COMMAND_BOUNDARY}rm\\s+(?:-[a-zA-Z]*[rRfF][a-zA-Z]*\\s+)+(?:/(?:\\s|$)|/(?:etc|usr|var|home|root|bin|sbin|opt|System|Library|private|boot|dev|proc|sys)(?:\\b|/)|~(?:\\s|/|$)|\\$HOME\\b|\\*(?:\\s|$))`,
+    ),
+    reason: "rm targeting root, a system directory, home, or bare wildcard",
+  },
+  // sudo 提权
+  {
+    pattern: new RegExp(`${COMMAND_BOUNDARY}sudo(?:\\s|$)`),
+    reason: "sudo (privilege escalation)",
+  },
+  // 关机 / 重启 / 停机
+  {
+    pattern: new RegExp(`${COMMAND_BOUNDARY}(?:shutdown|reboot|halt|poweroff)(?:\\s|$)`),
+    reason: "system power command",
+  },
+  // chmod 777 在根 / 家目录 / 裸通配符上。`chmod 755 script.sh`、`chmod 777 ./tmp` 不命中。
+  {
+    pattern: new RegExp(
+      `${COMMAND_BOUNDARY}chmod\\s+(?:-R\\s+)?[0-7]?777\\s+(?:/|~|\\$HOME|\\*)`,
+    ),
+    reason: "chmod 777 on root, home, or wildcard",
+  },
+  // dd 写入物理块设备
+  {
+    pattern: /(?:^|[\s;&|`(])dd\s[^;&|]*\bof=\/dev\/(?:sd|nvme|hd|vd|disk|mmcblk)/,
+    reason: "dd writing to a block device",
+  },
+  // 直接 `> /dev/sda` 重定向到块设备。`> /dev/null`、`> /tmp/out` 不命中。
+  {
+    pattern: />\s*\/dev\/(?:sd|nvme|hd|vd|disk|mmcblk)/,
+    reason: "redirect into a block device",
+  },
+  // 文件系统格式化
+  {
+    pattern: new RegExp(`${COMMAND_BOUNDARY}mkfs(?:\\.[a-zA-Z0-9]+)?\\s`),
+    reason: "filesystem format",
+  },
+  // curl/wget 直接管道到 shell，等同于无审查地执行远程脚本
+  {
+    pattern: /\b(?:curl|wget|fetch)\b[^|;&]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|ksh|fish|dash)\b/,
+    reason: "piping remote content into a shell",
+  },
+  // fork bomb
+  {
+    pattern: /:\s*\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;?\s*:/,
+    reason: "fork bomb",
+  },
+  // 强制推送会覆盖共享分支历史
+  {
+    pattern: new RegExp(
+      `${COMMAND_BOUNDARY}git\\s+push\\b[^;&|]*\\s(?:-f|--force(?:-with-lease)?)\\b`,
+    ),
+    reason: "git push --force (affects shared remote)",
+  },
+];
+
+// 多个连续空白合并成单空格，避免 `rm -rf  /` 这种多空格写法绕过子串匹配。
+// 不去掉引号 / 转义，因为那会改变命令语义。
+function normalizeForDangerCheck(command: string): string {
+  return command.replace(/\s+/g, " ").trim();
+}
+
+// 抽成独立纯函数是为了能直接做单元测试，而不必经过 child_process。
+export function detectDangerousCommand(command: string): string | null {
+  const normalized = normalizeForDangerCheck(command);
+  if (!normalized) return null;
+  for (const { pattern, reason } of DANGEROUS_COMMAND_PATTERNS) {
+    if (pattern.test(normalized)) return reason;
+  }
+  return null;
+}
+
+// 工具输出统一截断阈值。50K 字符大约对应 12K~15K tokens，足够覆盖一次合理工具调用，
+// 又不至于把上下文塞满。所有截断都走 `appendTruncationNotice`，保证模型能看到一致的提示。
+const TOOL_OUTPUT_MAX_BYTES = 50_000;
+
+// 模型不读字节数，所以截断提示用「行数」而不是「字节数」更直观。
+// 格式参考 Claude Code 的 BashTool/utils.ts：在 kept 后追加 `\n\n... [N lines truncated] ...`，
+// 模型流式从前往后读，看到末尾的提示行就知道内容被截断、可以选择再读 / 缩小范围。
+export function appendTruncationNotice(content: string, maxBytes: number = TOOL_OUTPUT_MAX_BYTES): string {
+  if (content.length <= maxBytes) return content;
+  const kept = content.slice(0, maxBytes);
+  // dropped 部分里的换行数 + 1 = 被截掉的行数（最后一行可能不完整也算一行）。
+  const dropped = content.slice(maxBytes);
+  const remainingLines = (dropped.match(/\n/g)?.length ?? 0) + 1;
+  return `${kept}\n\n... [${remainingLines} lines truncated] ...`;
+}
+
 async function runBash(command: string, signal?: AbortSignal): Promise<string> {
-  const dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
-  if (dangerous.some((snippet) => command.includes(snippet))) {
-    return "Error: Dangerous command blocked";
+  const dangerReason = detectDangerousCommand(command);
+  if (dangerReason) {
+    return `Error: Dangerous command blocked (${dangerReason})`;
   }
 
   try {
@@ -70,7 +176,7 @@ async function runBash(command: string, signal?: AbortSignal): Promise<string> {
       signal,
     });
     const combined = `${stdout}${stderr}`.trim();
-    return combined ? combined.slice(0, 50_000) : "(no output)";
+    return combined ? appendTruncationNotice(combined) : "(no output)";
   } catch (error) {
     if ((error as { name?: string } | null | undefined)?.name === "AbortError" || signal?.aborted) {
       return "Error: Command aborted";
@@ -82,7 +188,7 @@ async function runBash(command: string, signal?: AbortSignal): Promise<string> {
 
     const execError = toExecError(error);
     const combined = `${execError.stdout ?? ""}${execError.stderr ?? ""}`.trim();
-    return combined ? combined.slice(0, 50_000) : `Error: ${String(error)}`;
+    return combined ? appendTruncationNotice(combined) : `Error: ${String(error)}`;
   }
 }
 
@@ -94,7 +200,7 @@ function runRead(filePath: string, limit?: number): string {
     if (limit && limit < lines.length) {
       lines = [...lines.slice(0, limit), `... (${lines.length - limit} more lines)`];
     }
-    return lines.join("\n").slice(0, 50_000);
+    return appendTruncationNotice(lines.join("\n"));
   } catch (error) {
     return `Error: ${error instanceof Error ? error.message : String(error)}`;
   }
@@ -111,18 +217,360 @@ function runWrite(filePath: string, content: string): string {
   }
 }
 
+// 弯引号 / 直引号互转。
+//
+// 模型看不到弯引号会输出直引号，但很多文档（README、注释、字符串字面量）里
+// 真实存在的是弯引号；反之亦然。空白模糊匹配会改变代码语义（Python/YAML），
+// 这里只对引号这种「无歧义可逆」的字符做归一化。
+const LEFT_SINGLE_CURLY_QUOTE = "‘";
+const RIGHT_SINGLE_CURLY_QUOTE = "’";
+const LEFT_DOUBLE_CURLY_QUOTE = "“";
+const RIGHT_DOUBLE_CURLY_QUOTE = "”";
+
+export function normalizeQuotes(input: string): string {
+  return input
+    .replaceAll(LEFT_SINGLE_CURLY_QUOTE, "'")
+    .replaceAll(RIGHT_SINGLE_CURLY_QUOTE, "'")
+    .replaceAll(LEFT_DOUBLE_CURLY_QUOTE, '"')
+    .replaceAll(RIGHT_DOUBLE_CURLY_QUOTE, '"');
+}
+
+// 给定文件内容和模型给的 oldText，返回真正能用于替换的、来自文件的实际子串。
+// 失败则返回 null。命中规则只有两条：精确匹配 → 引号归一化匹配。
+export function findActualOldText(content: string, oldText: string): string | null {
+  if (content.includes(oldText)) return oldText;
+  const normalizedContent = normalizeQuotes(content);
+  const normalizedOld = normalizeQuotes(oldText);
+  const idx = normalizedContent.indexOf(normalizedOld);
+  if (idx === -1) return null;
+  // 归一化是字符级一一替换，长度不变，所以可以按相同偏移和长度从原文中切片。
+  return content.substring(idx, idx + oldText.length);
+}
+
+// 去掉每行末尾的水平空白，但保留行尾的 \r? \n。
+// markdown 的双空格行尾 = 硬换行，剥掉会改变渲染结果，因此 .md/.mdx 文件不调用这个函数。
+export function stripTrailingWhitespacePerLine(input: string): string {
+  return input.replace(/[ \t]+(\r?\n|$)/g, "$1");
+}
+
+function isMarkdownFile(filePath: string): boolean {
+  return /\.(md|mdx)$/i.test(filePath);
+}
+
 function runEdit(filePath: string, oldText: string, newText: string): string {
   try {
     const fullPath = safePath(filePath);
     const content = fs.readFileSync(fullPath, "utf8");
-    if (!content.includes(oldText)) {
-      return `Error: Text not found in ${filePath}`;
+
+    const actualOldText = findActualOldText(content, oldText);
+    if (actualOldText === null) {
+      return `Error: String not found in ${filePath}. Read the file again to confirm exact content.`;
     }
-    fs.writeFileSync(fullPath, content.replace(oldText, newText), "utf8");
+
+    const normalizedNewText = isMarkdownFile(filePath)
+      ? newText
+      : stripTrailingWhitespacePerLine(newText);
+
+    // 用回调形式的 replace 避免 $&、$1 等替换序列被解释成捕获组。
+    const updated = content.replace(actualOldText, () => normalizedNewText);
+    if (updated === content) {
+      return `Error: Edit produced no changes in ${filePath}. old_text and new_text appear to match the same content.`;
+    }
+
+    fs.writeFileSync(fullPath, updated, "utf8");
     return `Edited ${filePath}`;
   } catch (error) {
     return `Error: ${error instanceof Error ? error.message : String(error)}`;
   }
+}
+
+// --- web_fetch ---------------------------------------------------------------
+// MVP 版：拉取 URL -> 粗糙把 HTML 脱成文本 -> 按字符数截断。
+// 对齐 Claude Code WebFetch 的几条硬约束（URL 合法性、http→https 升级、10MB body、30s 超时），
+// 但不做二次总结、缓存、手动重定向防护等更重的事情。想升级再加。
+
+// 只做最基本的 URL 校验：协议白名单、长度、禁止携带账号密码、禁止明显的内网/非公共域名。
+// 所有更复杂的安全策略（domain blocklist、IP 范围校验）留给后续版本。
+export function validateFetchUrl(input: string): URL {
+  if (input.length > 2000) throw new Error("URL too long (>2000 chars)");
+  const url = new URL(input); // URL 构造函数会在格式非法时抛错
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`Unsupported protocol: ${url.protocol}`);
+  }
+  if (url.username || url.password) {
+    throw new Error("URL must not contain credentials");
+  }
+  // hostname 至少两段，过滤掉 'localhost' 这种内网名（127.0.0.1 有四段不受影响）。
+  const parts = url.hostname.split(".");
+  if (parts.length < 2 || parts.some((p) => p === "")) {
+    throw new Error("Hostname must be a publicly resolvable domain");
+  }
+  // http -> https 自动升级，减少明文流量。
+  if (url.protocol === "http:") url.protocol = "https:";
+  return url;
+}
+
+// 常见命名 HTML 实体映射。数字/十六进制实体通过正则单独处理。
+const HTML_NAMED_ENTITIES: Record<string, string> = {
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&apos;": "'",
+  "&#39;": "'",
+  "&nbsp;": " ",
+};
+
+// 粗糙 HTML -> 文本转换。没有引入 turndown / cheerio 等依赖，
+// 只是尽量保留段落感 + 去掉脚本样式 + 还原常见实体。
+// 够模型读懂文档类页面，但不保证结构复杂的页面能还原出理想 markdown。
+export function stripHtml(html: string): string {
+  let text = html
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "");
+  // 块级标签边界转换成换行，保留阅读节奏。
+  text = text
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|li|div|tr|h[1-6]|section|article|header|footer)>/gi, "\n")
+    .replace(/<[^>]+>/g, "");
+  // 解实体：先处理命名实体，再处理 &#123; 和 &#x1F;。
+  text = text.replace(/&(amp|lt|gt|quot|apos|#39|nbsp);/g, (m) => HTML_NAMED_ENTITIES[m] ?? m);
+  text = text.replace(/&#(\d+);/g, (_, n) => {
+    const code = Number(n);
+    return Number.isFinite(code) ? String.fromCodePoint(code) : "";
+  });
+  text = text.replace(/&#x([0-9a-fA-F]+);/g, (_, n) => {
+    const code = parseInt(n, 16);
+    return Number.isFinite(code) ? String.fromCodePoint(code) : "";
+  });
+  // 折叠多余空白：水平空白合并为单空格，连续空行最多两行。
+  return text
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+const WEB_FETCH_TIMEOUT_MS = 30_000;
+const WEB_FETCH_MAX_BODY_BYTES = 10 * 1024 * 1024;
+const WEB_FETCH_MAX_OUTPUT_CHARS = 100_000;
+
+async function runWebFetch(rawUrl: string, signal?: AbortSignal): Promise<string> {
+  let url: URL;
+  try {
+    url = validateFetchUrl(rawUrl);
+  } catch (error) {
+    return `Error: ${error instanceof Error ? error.message : String(error)}`;
+  }
+
+  // Node 自带 fetch 没有内建超时，用 AbortController 加一个 30s 硬上限。
+  // 上层已经传入 signal 时通过 AbortSignal.any 合并，这样任一触发都会中断请求。
+  const timeoutController = new AbortController();
+  const timer = setTimeout(() => timeoutController.abort(), WEB_FETCH_TIMEOUT_MS);
+  const combinedSignal = signal
+    ? AbortSignal.any([signal, timeoutController.signal])
+    : timeoutController.signal;
+
+  let response: Response;
+  try {
+    response = await fetch(url.toString(), {
+      signal: combinedSignal,
+      redirect: "follow",
+      headers: {
+        "user-agent": "code-agent-web-fetch/1.0",
+        accept: "text/html, text/markdown, text/plain, */*",
+      },
+    });
+  } catch (error) {
+    clearTimeout(timer);
+    if (signal?.aborted) return "Error: Aborted";
+    if (timeoutController.signal.aborted) return `Error: Timeout (${WEB_FETCH_TIMEOUT_MS / 1000}s)`;
+    return `Error: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    return `Error: HTTP ${response.status} ${response.statusText || ""}`.trim();
+  }
+
+  const contentType = response.headers.get("content-type") ?? "";
+  let bodyText: string;
+  try {
+    bodyText = await response.text();
+  } catch (error) {
+    return `Error: failed to read body: ${error instanceof Error ? error.message : String(error)}`;
+  }
+
+  if (Buffer.byteLength(bodyText, "utf8") > WEB_FETCH_MAX_BODY_BYTES) {
+    return `Error: response body exceeds ${WEB_FETCH_MAX_BODY_BYTES / (1024 * 1024)}MB limit`;
+  }
+
+  // 粗判 HTML：要么 content-type 明确，要么开头有 <html>/<!doctype>。
+  // 非 HTML 内容（JSON、纯文本、markdown）原样返回，避免误伤结构化数据。
+  const looksLikeHtml = contentType.includes("text/html") || /^\s*<!doctype html|^\s*<html[\s>]/i.test(bodyText);
+  const content = looksLikeHtml ? stripHtml(bodyText) : bodyText;
+
+  const body = appendTruncationNotice(content, WEB_FETCH_MAX_OUTPUT_CHARS);
+  const header = [
+    `URL: ${response.url || url.toString()}`,
+    `Status: ${response.status}`,
+    `Content-Type: ${contentType || "unknown"}`,
+    `Bytes: ${Buffer.byteLength(bodyText, "utf8")}`,
+  ].join("\n");
+  return `${header}\n---\n${body}`;
+}
+
+// ripgrep 不存在或被中断时统一归一化成可读的错误字符串，避免把 Node 的 Error 原样塞回模型。
+// execFile 失败时的错误对象同时可能带 ErrnoException 的 "ENOENT" 字符串 code 和进程退出的数字 code，
+// 为了一个守卫里都能处理，这里故意用宽松类型。
+type RgExecError = Error & {
+  code?: number | string;
+  stdout?: string;
+  stderr?: string;
+};
+
+function describeRgFailure(error: unknown, signal?: AbortSignal): string | null {
+  const err = error as RgExecError;
+  if (err?.code === "ENOENT") {
+    return "Error: ripgrep (rg) is not installed. Install via `brew install ripgrep` or fall back to bash grep/find.";
+  }
+  if (signal?.aborted || err?.name === "AbortError") {
+    return "Error: Aborted";
+  }
+  return null;
+}
+
+// glob 工具：用 `rg --files --glob <pattern>` 列出匹配文件，再按 mtime 倒序截断到 100 条。
+// 选择 rg 而不是 Node 自己遍历，是因为 rg 尊重 .gitignore，并且在大仓库里快一个数量级。
+async function runGlob(pattern: string, relPath: string | undefined, signal?: AbortSignal): Promise<string> {
+  const searchDir = relPath ? safePath(relPath) : WORKDIR;
+  const args = [
+    "--files",
+    "--glob",
+    pattern,
+    // 排除典型噪音目录；用户真需要时可以显式在 pattern 里覆盖。
+    "--glob",
+    "!.git",
+    "--glob",
+    "!node_modules",
+  ];
+  let files: string[] = [];
+  try {
+    const { stdout } = await execFileAsync("rg", args, {
+      cwd: searchDir,
+      maxBuffer: 10 * 1024 * 1024,
+      signal,
+    });
+    files = stdout.split("\n").filter(Boolean);
+  } catch (error) {
+    const friendly = describeRgFailure(error, signal);
+    if (friendly) return friendly;
+    const err = error as RgExecError;
+    // rg exit code 1 表示「没有匹配」，不是错误。
+    if (err.code === 1) {
+      files = (err.stdout ?? "").split("\n").filter(Boolean);
+    } else {
+      return `Error: ${err.message ?? String(err)}`;
+    }
+  }
+  if (files.length === 0) return "No files found";
+
+  // 按 mtime 倒排，最近改过的文件最有可能是用户关心的目标。
+  const stats = await Promise.all(
+    files.map(async (rel) => {
+      try {
+        const st = await fs.promises.stat(path.join(searchDir, rel));
+        return { rel, mtime: st.mtimeMs };
+      } catch {
+        return { rel, mtime: 0 };
+      }
+    }),
+  );
+  stats.sort((a, b) => b.mtime - a.mtime);
+
+  const LIMIT = 100;
+  const kept = stats.slice(0, LIMIT).map((x) => x.rel);
+  const truncated = stats.length > LIMIT;
+  const lines = [
+    ...kept,
+    ...(truncated ? [`(Results truncated to first ${LIMIT} of ${stats.length} matches. Narrow the pattern.)`] : []),
+  ];
+  return lines.join("\n");
+}
+
+// grep 工具：把结构化参数翻译成 ripgrep flags，再对 stdout 做 head_limit 截断。
+// 这里只暴露最常用的一组开关，复杂检索仍可通过 bash 里手写 rg 完成。
+async function runGrep(args: ToolArgs, signal?: AbortSignal): Promise<string> {
+  const pattern = typeof args.pattern === "string" ? args.pattern : "";
+  if (!pattern) return "Error: pattern is required";
+
+  const outputMode = (args.output_mode as string | undefined) ?? "files_with_matches";
+  const rgArgs: string[] = [];
+
+  if (outputMode === "files_with_matches") rgArgs.push("--files-with-matches");
+  else if (outputMode === "count") rgArgs.push("--count");
+  // content 模式走 rg 默认输出，加 -n 显示行号。
+
+  if (args.case_insensitive === true) rgArgs.push("-i");
+  if (args.multiline === true) rgArgs.push("-U", "--multiline-dotall");
+
+  if (outputMode === "content") {
+    rgArgs.push("-n");
+    if (typeof args.context === "number" && args.context > 0) {
+      rgArgs.push("-C", String(args.context));
+    }
+  }
+  if (typeof args.glob === "string") rgArgs.push("--glob", args.glob);
+  if (typeof args.type === "string") rgArgs.push("--type", args.type);
+
+  // 排除 VCS / 依赖目录，避免噪音。和 Claude Code GrepTool 保持一致。
+  for (const d of [".git", ".svn", ".hg", ".bzr", ".jj", ".sl", "node_modules"]) {
+    rgArgs.push("--glob", `!${d}`);
+  }
+
+  // `--` 明确 pattern 的边界，防止以 `-` 开头的正则被当作 flag。
+  rgArgs.push("--", pattern);
+
+  let searchPath: string | undefined;
+  if (typeof args.path === "string") {
+    searchPath = safePath(args.path);
+    rgArgs.push(searchPath);
+  }
+
+  let stdout = "";
+  try {
+    const result = await execFileAsync("rg", rgArgs, {
+      cwd: WORKDIR,
+      maxBuffer: 20 * 1024 * 1024,
+      signal,
+    });
+    stdout = result.stdout;
+  } catch (error) {
+    const friendly = describeRgFailure(error, signal);
+    if (friendly) return friendly;
+    const err = error as RgExecError;
+    if (err.code === 1) {
+      stdout = err.stdout ?? ""; // 没命中
+    } else {
+      return `Error: ${err.message ?? String(err)}`;
+    }
+  }
+
+  if (!stdout.trim()) return "No matches found";
+
+  // head_limit: 默认 250 行，0 表示不限制。
+  const headLimit = typeof args.head_limit === "number" ? args.head_limit : 250;
+  const lines = stdout.split("\n");
+  // rg 输出末尾通常有空行，去掉免得占配额。
+  while (lines.length && lines[lines.length - 1] === "") lines.pop();
+
+  if (headLimit === 0) return stdout.slice(0, 500_000);
+
+  const total = lines.length;
+  const kept = lines.slice(0, headLimit);
+  if (total <= headLimit) return kept.join("\n");
+  return `${kept.join("\n")}\n(Output truncated to first ${headLimit} of ${total} lines. Pass head_limit=0 to disable.)`;
 }
 
 function toOptionalNumber(value: unknown): number | undefined {
@@ -189,6 +637,77 @@ export const BASE_TOOLS = [
         new_text: { type: "string" },
       },
       required: ["path", "old_text", "new_text"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "glob",
+    description:
+      "Find files by glob pattern (powered by ripgrep). Returns up to 100 paths sorted by modification time (newest first). Prefer this over `bash find` or `ls`: respects .gitignore, consistent output, truncation built in.",
+    parameters: {
+      type: "object",
+      properties: {
+        pattern: {
+          type: "string",
+          description: "Glob pattern, e.g. '**/*.ts', 'src/**/*.tsx', '*.json'.",
+        },
+        path: {
+          type: "string",
+          description: "Directory to search in (relative to workspace). Omit to search the whole workspace.",
+        },
+      },
+      required: ["pattern"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "grep",
+    description:
+      "Search file contents with ripgrep (full regex, .gitignore-aware). Prefer this over `bash grep`: the output is capped (default 250 lines) so your context cannot be flooded. For open-ended multi-round exploration, dispatch the `task` tool with the explore subagent instead.",
+    parameters: {
+      type: "object",
+      properties: {
+        pattern: {
+          type: "string",
+          description: "Regex pattern (ripgrep syntax). Literal braces need escaping: use '\\{\\}' to match '{}'.",
+        },
+        path: {
+          type: "string",
+          description: "File or directory to search in. Omit to search the whole workspace.",
+        },
+        glob: {
+          type: "string",
+          description: "Glob filter, e.g. '*.ts', '*.{js,tsx}'.",
+        },
+        type: {
+          type: "string",
+          description: "File type shortcut, e.g. 'js', 'py', 'rust'. More efficient than `glob` for standard types.",
+        },
+        output_mode: {
+          type: "string",
+          enum: ["content", "files_with_matches", "count"],
+          description: "Default 'files_with_matches'. Use 'content' to see matching lines, 'count' for per-file match counts.",
+        },
+        case_insensitive: {
+          type: "boolean",
+          description: "Case-insensitive match (rg -i).",
+        },
+        context: {
+          type: "integer",
+          description: "Lines of context before and after each match. Only applied when output_mode='content'.",
+        },
+        head_limit: {
+          type: "integer",
+          description: "Max output lines. Defaults to 250. Pass 0 to disable the cap (use sparingly).",
+        },
+        multiline: {
+          type: "boolean",
+          description: "Enable multiline matching (rg -U --multiline-dotall).",
+        },
+      },
+      required: ["pattern"],
       additionalProperties: false,
     },
   },
@@ -453,6 +972,8 @@ export const BASE_TOOL_HANDLERS: Record<string, (args: ToolArgs, control?: { sig
   read_file: ({ path: filePath, limit }) => runRead(String(filePath), toOptionalNumber(limit)),
   write_file: ({ path: filePath, content }) => runWrite(String(filePath), String(content)),
   edit_file: ({ path: filePath, old_text, new_text }) => runEdit(String(filePath), String(old_text), String(new_text)),
+  glob: ({ pattern, path: p }, control) => runGlob(String(pattern), toOptionalString(p), control?.signal),
+  grep: (args, control) => runGrep(args, control?.signal),
   list_mcp_resources: (args) => handleListMcpResources(args),
   read_mcp_resource: (args) => handleReadMcpResource(args),
   mcp_call: (args) => handleMcpCall(args),

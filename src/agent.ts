@@ -1,12 +1,18 @@
 import OpenAI, { APIUserAbortError } from "openai";
 
-import { microCompact, estimateTokens, autoCompact, TOKEN_THRESHOLD } from "./compact.js";
+import {
+  microCompact,
+  estimateTokens,
+  autoCompact,
+  autoCompactResponseHistory,
+  TOKEN_THRESHOLD,
+} from "./compact.js";
 import { getDynamicMcpToolSurface } from "./mcp/runtime.js";
 import { messageBus, teammateManager, LEAD_NAME, TOOLS, CHAT_TOOLS, BASE_TOOLS, BASE_CHAT_TOOLS, TEAMMATE_TOOLS, TEAMMATE_CHAT_TOOLS, BASE_TOOL_HANDLERS, taskManager } from "./tools.js";
 import { renderInboxPrompt } from "./message-bus.js";
 import { getSubagentDefinition, type SubagentDefinition } from "./subagents.js";
 import type { TeammateRuntimeControl } from "./teammate-manager.js";
-import type { ToolArgs, ResponseInputItem, ChatMessage, AgentState, UiBridge } from "./types.js";
+import type { ToolArgs, ResponseInputItem, ChatMessage, AgentState, UiBridge, TokenUsage } from "./types.js";
 
 const NAG_THRESHOLD = 3;
 const NAG_MESSAGE = "<reminder>Update your tasks with task_list or task_update.</reminder>";
@@ -122,6 +128,18 @@ function buildUserResponseMessage(text: string): ResponseInputItem {
       },
     ],
   };
+}
+
+/**
+ * 在 Responses 模式切链后的首轮请求里，把 compact 摘要显式拼回用户输入。
+ *
+ * 为什么需要这一步：
+ * - 支持 `previous_response_id` 的 provider 平时把上下文保存在服务端，不会自动重放本地 `responseHistory`。
+ * - 一旦 compact 时主动断开旧链，如果下一轮只发送新的用户问题，模型就会失去 compact 前的连续性。
+ * - 这里把 compact 摘要和当前用户请求合并成一条 user message，可以在不改请求协议的前提下恢复上下文。
+ */
+function buildCompactedResponsesQuery(summary: string, query: string): string {
+  return `${summary}\n\nCurrent user request:\n${query}`;
 }
 
 /**
@@ -301,6 +319,7 @@ function createSilentBridge(): UiBridge {
     finalizeStreaming() {},
     pushAssistant() {},
     pushTool() {},
+    updateUsage() {},
   };
 }
 
@@ -410,6 +429,22 @@ async function prepareToolRuntime(
   };
 }
 
+function calculateCost(inputTokens: number, outputTokens: number, cachedInputTokens: number): number {
+  const uncachedInput = Math.max(0, inputTokens - cachedInputTokens);
+  return (uncachedInput * 2.0 + cachedInputTokens * 0.5 + outputTokens * 8.0) / 1_000_000;
+}
+
+function extractTokenUsage(usage: any): TokenUsage {
+  const inputTokens = Number(usage?.input_tokens ?? usage?.prompt_tokens ?? 0);
+  const outputTokens = Number(usage?.output_tokens ?? usage?.completion_tokens ?? 0);
+  const cachedInputTokens = Number(
+    usage?.input_token_details?.cached_tokens ??
+    usage?.prompt_tokens_details?.cached_tokens ?? 0,
+  );
+  const cost = calculateCost(inputTokens, outputTokens, cachedInputTokens);
+  return { inputTokens, outputTokens, cachedInputTokens, cost };
+}
+
 async function streamResponse(
   client: OpenAI,
   model: string,
@@ -420,6 +455,7 @@ async function streamResponse(
   bridge: UiBridge,
   tools: readonly any[] = TOOLS,
   control?: RunControl,
+  onUsage?: (usage: TokenUsage) => void,
 ): Promise<any> {
   throwIfAborted(control?.signal);
   const normalizedInstructions = system.trim() || "You are a helpful coding assistant.";
@@ -567,6 +603,9 @@ async function streamResponse(
     }
 
     const response = await stream.finalResponse();
+    if (response.usage) {
+      onUsage?.(extractTokenUsage(response.usage));
+    }
     const sdkOutput = Array.isArray(response.output) ? response.output : [];
     const recoveredAssistantText = extractAssistantTextFromResponseOutput(sdkOutput);
     const missingAssistantText = getMissingAssistantText(assistantText, recoveredAssistantText);
@@ -635,6 +674,7 @@ async function streamChatCompletion(
   tools: readonly any[] = CHAT_TOOLS,
   showThinking: boolean = false,
   control?: RunControl,
+  onUsage?: (usage: TokenUsage) => void,
 ): Promise<{ content: string | null; tool_calls: any[]; reasoning_content?: string }> {
   throwIfAborted(control?.signal);
 
@@ -644,6 +684,7 @@ async function streamChatCompletion(
     tools: tools as any,
     tool_choice: "auto",
     stream: true,
+    stream_options: { include_usage: true },
   };
   if (showThinking) {
     createParams.thinking = { type: "enabled" };
@@ -659,6 +700,9 @@ async function streamChatCompletion(
 
   try {
     for await (const chunk of stream) {
+      if (chunk.usage) {
+        onUsage?.(extractTokenUsage(chunk.usage));
+      }
       const delta = chunk.choices?.[0]?.delta as any;
       if (!delta) continue;
 
@@ -1060,6 +1104,7 @@ async function agentLoop(
   handlers: ToolHandlerMap,
   tools: readonly any[] = TOOLS,
   control?: RunControl,
+  onUsage?: (usage: TokenUsage) => void,
 ): Promise<string | undefined> {
   /**
    * Most Responses providers support `previous_response_id`, so they can keep
@@ -1068,9 +1113,18 @@ async function agentLoop(
    * conversation transcript on every round instead.
    */
   const usesStatelessReplay = !config.supportsPreviousResponseId;
-  const replayHistory = usesStatelessReplay
-    ? [...state.responseHistory.map((item) => cloneResponseReplayItem(item)), buildUserResponseMessage(query)]
-    : [];
+  /**
+   * 无论 provider 是否支持 `previous_response_id`，本地都持续维护一份可重放历史。
+   *
+   * 为什么要在 stateful provider 上也这么做：
+   * - responses 模式的 compact 需要本地历史做总结，否则只能定期把链路清空。
+   * - `/resume`、状态栏估算、手动 `/compact` 也都依赖同一份本地上下文副本。
+   * - 真正请求模型时，只有 stateless 分支会重放它，因此不会改变支持服务端链路的正常交互成本。
+   */
+  const replayHistory = [
+    ...state.responseHistory.map((item) => cloneResponseReplayItem(item)),
+    buildUserResponseMessage(query),
+  ];
   let nextInput: ResponseInputItem[] | string = usesStatelessReplay
     ? replayHistory
     : [buildUserResponseMessage(query)];
@@ -1092,18 +1146,14 @@ async function agentLoop(
     );
     currentResponseId = response.id;
 
-    if (usesStatelessReplay) {
-      replayHistory.push(...collectReplayableResponseOutput(response.output));
-    }
+    replayHistory.push(...collectReplayableResponseOutput(response.output));
 
     const toolCalls = Array.isArray(response.output)
       ? response.output.filter((item: any) => item.type === "function_call")
       : [];
 
     if (toolCalls.length === 0) {
-      if (usesStatelessReplay) {
-        state.responseHistory = replayHistory.map((item) => cloneResponseReplayItem(item));
-      }
+      state.responseHistory = replayHistory.map((item) => cloneResponseReplayItem(item));
       return currentResponseId;
     }
 
@@ -1124,8 +1174,9 @@ async function agentLoop(
       }
     }
 
+    replayHistory.push(...results.map((item) => cloneResponseReplayItem(item)));
+
     if (usesStatelessReplay) {
-      replayHistory.push(...results.map((item) => cloneResponseReplayItem(item)));
       nextInput = replayHistory;
       currentResponseId = undefined;
     } else {
@@ -1142,6 +1193,7 @@ async function agentLoopWithChatCompletions(
   handlers: ToolHandlerMap,
   tools: readonly any[] = CHAT_TOOLS,
   control?: RunControl,
+  onUsage?: (usage: TokenUsage) => void,
 ): Promise<void> {
   while (true) {
     throwIfAborted(control?.signal);
@@ -1151,7 +1203,7 @@ async function agentLoopWithChatCompletions(
       bridge.pushAssistant("Context approaching limit, compacting conversation...");
       const compacted = await autoCompact(config.client, config.model, history);
       history.length = 0;
-      history.push(...compacted);
+      history.push(...compacted.messages);
       state.compactCount += 1;
     }
 
@@ -1166,6 +1218,7 @@ async function agentLoopWithChatCompletions(
         tools,
         config.showThinking,
         control,
+        onUsage,
       );
     } catch (error) {
       if (error instanceof TurnInterruptedError && error.partialAssistantText) {
@@ -1233,6 +1286,15 @@ async function runTurn(
   state.turnCount += 1;
   state.roundsSinceTask = 0;
 
+  const turnUsage: TokenUsage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cost: 0 };
+  const onUsage = (u: TokenUsage) => {
+    turnUsage.inputTokens += u.inputTokens;
+    turnUsage.outputTokens += u.outputTokens;
+    turnUsage.cachedInputTokens += u.cachedInputTokens;
+    turnUsage.cost += u.cost;
+    bridge.updateUsage({ ...turnUsage });
+  };
+
   if (apiMode === "chat-completions") {
     for (const msg of state.chatHistory) {
       if (msg.role === "assistant" && "reasoning_content" in msg) {
@@ -1246,13 +1308,13 @@ async function runTurn(
       bridge.pushAssistant("Context approaching limit, compacting conversation...");
       const compacted = await autoCompact(config.client, config.model, state.chatHistory);
       state.chatHistory.length = 0;
-      state.chatHistory.push(...compacted);
+      state.chatHistory.push(...compacted.messages);
       state.compactCount += 1;
     }
 
     state.chatHistory.push({ role: "user", content: query });
     try {
-      await agentLoopWithChatCompletions(config, state.chatHistory, bridge, state, handlers, chatTools, control);
+      await agentLoopWithChatCompletions(config, state.chatHistory, bridge, state, handlers, chatTools, control, onUsage);
     } catch (error) {
       if (error instanceof TurnInterruptedError) {
         repairInterruptedToolCallHistory(state.chatHistory);
@@ -1264,15 +1326,50 @@ async function runTurn(
 
   if (state.turnCount > 1 && (state.turnCount - 1) % RESPONSES_COMPACT_INTERVAL === 0) {
     bridge.pushAssistant("Compacting Responses API context chain...");
+    if (state.responseHistory.length > 0) {
+      const compacted = await autoCompactResponseHistory(
+        config.client,
+        config.model,
+        state.responseHistory,
+      );
+      state.responseHistory = compacted.messages;
+      /**
+       * 仅 stateful provider 需要额外保存待注入的 compact 摘要。
+       *
+       * 为什么 stateless replay 不需要：
+       * - stateless 分支下一轮会直接发送 `state.responseHistory`，其中已经包含 compact summary。
+       * - stateful 分支不会默认重放本地历史，所以切链后的第一轮必须显式把摘要带回请求里。
+       */
+      state.pendingCompactedContext = config.supportsPreviousResponseId
+        ? compacted.continuationMessage
+        : undefined;
+    }
     state.previousResponseId = undefined;
     state.compactCount += 1;
   }
 
+  const pendingCompactedContext = state.pendingCompactedContext;
+  const responsesQuery = pendingCompactedContext
+    ? buildCompactedResponsesQuery(pendingCompactedContext, query)
+    : query;
+
   try {
-    state.previousResponseId = await agentLoop(config, query, state.previousResponseId, bridge, state, handlers, responseTools, control);
+    state.previousResponseId = await agentLoop(
+      config,
+      responsesQuery,
+      state.previousResponseId,
+      bridge,
+      state,
+      handlers,
+      responseTools,
+      control,
+      onUsage,
+    );
+    state.pendingCompactedContext = undefined;
   } catch (error) {
     if (error instanceof TurnInterruptedError && error.responseId) {
       state.previousResponseId = error.responseId;
+      state.pendingCompactedContext = undefined;
     }
     throw error;
   }
