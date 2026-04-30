@@ -5,16 +5,30 @@ export interface Task {
   id: number;
   subject: string;
   description: string;
-  status: "pending" | "in_progress" | "completed";
+  status: "pending" | "assigned" | "in_progress" | "blocked" | "completed" | "failed";
+  owner: string;
+  assignee?: string;
+  threadId: string;
+  resultSummary?: string;
+  blockedReason?: string;
+  createdAt: string;
+  updatedAt: string;
   blockedBy: number[];
   blocks: number[];
 }
 
 const STATUS_SYMBOLS: Record<Task["status"], string> = {
   pending: "[ ]",
+  assigned: "[=]",
   in_progress: "[>]",
+  blocked: "[! ]",
   completed: "[x]",
+  failed: "[-]",
 };
+
+function createThreadId(taskId: number): string {
+  return `task_${taskId}`;
+}
 
 export class TaskManager {
   private dir: string;
@@ -35,13 +49,33 @@ export class TaskManager {
     return path.join(this.dir, `task_${id}.json`);
   }
 
+  private normalizeTask(task: Task): Task {
+    const now = new Date().toISOString();
+    return {
+      id: task.id,
+      subject: task.subject,
+      description: task.description ?? "",
+      status: task.status ?? "pending",
+      owner: task.owner ?? "lead",
+      assignee: task.assignee,
+      threadId: task.threadId ?? createThreadId(task.id),
+      resultSummary: task.resultSummary,
+      blockedReason: task.blockedReason,
+      createdAt: task.createdAt ?? now,
+      updatedAt: task.updatedAt ?? task.createdAt ?? now,
+      blockedBy: Array.isArray(task.blockedBy) ? task.blockedBy : [],
+      blocks: Array.isArray(task.blocks) ? task.blocks : [],
+    };
+  }
+
   private load(id: number): Task {
     const content = fs.readFileSync(this.taskPath(id), "utf8");
-    return JSON.parse(content) as Task;
+    return this.normalizeTask(JSON.parse(content) as Task);
   }
 
   private save(task: Task): void {
-    fs.writeFileSync(this.taskPath(task.id), JSON.stringify(task, null, 2), "utf8");
+    const normalized = this.normalizeTask(task);
+    fs.writeFileSync(this.taskPath(normalized.id), JSON.stringify(normalized, null, 2), "utf8");
   }
 
   private allTasks(): Task[] {
@@ -52,13 +86,19 @@ export class TaskManager {
     });
   }
 
-  create(subject: string, description?: string): string {
+  create(subject: string, description?: string, owner = "lead", assignee?: string): string {
     const id = this.nextId();
+    const now = new Date().toISOString();
     const task: Task = {
       id,
       subject,
       description: description ?? "",
-      status: "pending",
+      status: assignee ? "assigned" : "pending",
+      owner,
+      assignee,
+      threadId: createThreadId(id),
+      createdAt: now,
+      updatedAt: now,
       blockedBy: [],
       blocks: [],
     };
@@ -66,7 +106,15 @@ export class TaskManager {
     return JSON.stringify(task, null, 2);
   }
 
-  update(taskId: number, status?: string, addBlockedBy?: number[], addBlocks?: number[]): string {
+  update(
+    taskId: number,
+    status?: string,
+    addBlockedBy?: number[],
+    addBlocks?: number[],
+    assignee?: string,
+    resultSummary?: string,
+    blockedReason?: string,
+  ): string {
     let task: Task;
     try {
       task = this.load(taskId);
@@ -77,35 +125,54 @@ export class TaskManager {
     if (addBlockedBy) {
       for (const depId of addBlockedBy) {
         if (!task.blockedBy.includes(depId)) task.blockedBy.push(depId);
-        // Update the reverse side
         try {
           const dep = this.load(depId);
           if (!dep.blocks.includes(taskId)) {
             dep.blocks.push(taskId);
+            dep.updatedAt = new Date().toISOString();
             this.save(dep);
           }
-        } catch { /* dep not found, skip */ }
+        } catch {}
       }
     }
 
     if (addBlocks) {
       for (const depId of addBlocks) {
         if (!task.blocks.includes(depId)) task.blocks.push(depId);
-        // Update the reverse side
         try {
           const dep = this.load(depId);
           if (!dep.blockedBy.includes(taskId)) {
             dep.blockedBy.push(taskId);
+            dep.updatedAt = new Date().toISOString();
             this.save(dep);
           }
-        } catch { /* dep not found, skip */ }
+        } catch {}
       }
+    }
+
+    if (typeof assignee === "string" && assignee.trim()) {
+      task.assignee = assignee.trim();
+      if (task.status === "pending") {
+        task.status = "assigned";
+      }
+    }
+
+    if (typeof resultSummary === "string") {
+      task.resultSummary = resultSummary;
+    }
+
+    if (typeof blockedReason === "string") {
+      task.blockedReason = blockedReason;
     }
 
     if (status) {
       task.status = status as Task["status"];
+      if (status !== "blocked") {
+        task.blockedReason = blockedReason ?? task.blockedReason;
+      }
     }
 
+    task.updatedAt = new Date().toISOString();
     this.save(task);
 
     if (task.status === "completed") {
@@ -121,6 +188,7 @@ export class TaskManager {
       const idx = t.blockedBy.indexOf(completedId);
       if (idx !== -1) {
         t.blockedBy.splice(idx, 1);
+        t.updatedAt = new Date().toISOString();
         this.save(t);
       }
     }
@@ -132,21 +200,77 @@ export class TaskManager {
     return tasks
       .map((t) => {
         let line = `${STATUS_SYMBOLS[t.status]} #${t.id}: ${t.subject}`;
+        if (t.assignee) line += ` assignee=${t.assignee}`;
         if (t.blockedBy.length > 0) line += ` (blocked by: ${t.blockedBy.join(", ")})`;
+        if (t.blockedReason) line += ` reason=${t.blockedReason}`;
         return line;
       })
       .join("\n");
   }
 
-  get(taskId: number): string {
+  getTask(taskId: number): Task | null {
     try {
-      return JSON.stringify(this.load(taskId), null, 2);
+      return this.load(taskId);
     } catch {
-      return `Error: Task ${taskId} not found.`;
+      return null;
     }
   }
 
+  listTasks(): Task[] {
+    return this.allTasks().sort((left, right) => left.id - right.id);
+  }
+
+  listAssignedTo(name: string): Task[] {
+    const normalized = name.trim();
+    return this.listTasks().filter((task) => task.assignee === normalized && ["assigned", "in_progress", "blocked"].includes(task.status));
+  }
+
+  claimNext(assignee: string): Task | null {
+    const nextTask = this.listTasks()
+      .filter((task) => task.assignee === assignee && task.status === "assigned")
+      .sort((left, right) => left.id - right.id)[0];
+
+    if (!nextTask) {
+      return null;
+    }
+
+    nextTask.status = "in_progress";
+    nextTask.updatedAt = new Date().toISOString();
+    this.save(nextTask);
+    return nextTask;
+  }
+
+  formatTask(taskId: number): string {
+    const task = this.getTask(taskId);
+    if (!task) {
+      return `Error: Task ${taskId} not found.`;
+    }
+
+    const lines = [
+      `#${task.id} ${task.subject}`,
+      `status=${task.status}`,
+      `owner=${task.owner}`,
+      `assignee=${task.assignee ?? "-"}`,
+      `thread=${task.threadId}`,
+      `created_at=${task.createdAt}`,
+      `updated_at=${task.updatedAt}`,
+    ];
+
+    if (task.description) lines.push("", task.description);
+    if (task.resultSummary) lines.push("", `result: ${task.resultSummary}`);
+    if (task.blockedReason) lines.push("", `blocked: ${task.blockedReason}`);
+    if (task.blockedBy.length > 0) lines.push(`blocked_by=${task.blockedBy.join(", ")}`);
+    if (task.blocks.length > 0) lines.push(`blocks=${task.blocks.join(", ")}`);
+
+    return lines.join("\n");
+  }
+
+  get(taskId: number): string {
+    const task = this.getTask(taskId);
+    return task ? JSON.stringify(task, null, 2) : `Error: Task ${taskId} not found.`;
+  }
+
   hasActiveTasks(): boolean {
-    return this.allTasks().some((t) => t.status === "pending" || t.status === "in_progress");
+    return this.allTasks().some((t) => ["pending", "assigned", "in_progress", "blocked"].includes(t.status));
   }
 }

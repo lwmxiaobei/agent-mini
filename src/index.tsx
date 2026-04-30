@@ -17,6 +17,8 @@ import wrapAnsi from "wrap-ansi";
 import pkg from "../package.json" with { type: "json" };
 
 import { isTurnInterruptedError, runAgentTurn, type AgentConfig } from "./agent.js";
+// P1：删除 supervisor.ts（processLeadInboxEvents 依赖的 eventType/taskId 协议字段已移除）。
+// P3 协议消息阶段会用独立机制重做事件处理，不再混在 lead 邮箱消费流程里。
 import {
   clearProviderCredentials,
   getCredentialsPath,
@@ -38,9 +40,10 @@ import {
   type StoredOAuthCredentials,
 } from "./config.js";
 import { estimateTokens, autoCompact, autoCompactResponseHistory } from "./compact.js";
+import { createSharedFetch } from "./http.js";
 import { normalizeCommand, parseStartupCommand, submissionNeedsSelectedModel } from "./commands.js";
 import { createSubmitDeduper, getSubmittedValueFromInput } from "./input-submit.js";
-import { formatMailboxMessages, renderInboxPrompt } from "./message-bus.js";
+import { formatTeammateMessages } from "./message-bus.js";
 import { ensureMcpInitialized, getMcpPromptInstructions, mcpManager, primeMcpRuntime, refreshMcpFromSettings } from "./mcp/runtime.js";
 import {
   OPENAI_CODEX_BASE_URL,
@@ -52,8 +55,9 @@ import {
 } from "./oauth/openai.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { appendSessionCheckpoint, createSessionId, listRecentSessions, loadSession, type SessionSnapshot } from "./session-store.js";
-import { skillLoader, messageBus, teammateManager } from "./tools.js";
+import { skillLoader, messageBus, taskManager, teammateManager } from "./tools.js";
 import type { AgentState, DiffLine, PersistedUiMessage, TokenUsage, UiBridge, UiMessage } from "./types.js";
+import { fetchOpenAIUsage, formatUsageReport, UsageRequestError } from "./usage.js";
 import { ellipsize } from "./utils.js";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -81,6 +85,9 @@ function createAgentConfig(resolved: ResolvedConfig, authState?: ProviderAuthSta
     : {
         apiKey: bearerToken,
         baseURL: resolved.baseURL !== "https://api.openai.com/v1" ? resolved.baseURL : undefined,
+        // 共享 dispatcher 把闲置 keep-alive 连接保留时间压到 1s，避免在多轮工具
+        // 执行的间隔后下一轮 stream 拿到一条已被远端关闭的连接、立刻报 `terminated`。
+        fetch: createSharedFetch(),
       };
   const client = new OpenAI(clientOptions);
   return {
@@ -215,11 +222,14 @@ const MAX_VISIBLE_SLASH_MATCHES = 8;
 const SLASH_COMMANDS: SlashCommand[] = [
   { command: "/help", description: "show available commands" },
   { command: "/status", description: "show session status" },
+  { command: "/usage", description: "show codex subscription usage (5h / weekly limits)" },
   { command: "/login", description: "start oauth login for the current provider" },
   { command: "/logout", description: "clear oauth credentials for the current provider" },
   { command: "/mcp", description: "show MCP server status" },
   { command: "/mcp refresh", description: "refresh MCP caches and reconnect servers" },
   { command: "/team", description: "show teammate statuses" },
+  { command: "/tasks", description: "show task board" },
+  { command: "/task", description: "show task details by id" },
   { command: "/inbox", description: "drain lead inbox" },
   { command: "/provider", description: "switch provider" },
   { command: "/model", description: "switch model within current provider" },
@@ -625,6 +635,7 @@ function helpMessage(): string {
   return [
     "help                show available commands",
     "status              show session status",
+    "usage               show codex subscription usage (5h / weekly limits)",
     "mcp [refresh [name]] show MCP status or refresh all / one server",
     "team                show teammate statuses",
     "inbox               drain lead inbox",
@@ -645,12 +656,15 @@ function helpMessage(): string {
   ].join("\n");
 }
 
-function sessionStatus(state: AgentState, tokenUsage?: TokenUsage): string {
+// P1 异步化：lead 邮箱未读数走 MessageBus.unreadCount（async）。
+// status 命令本身已经在 async 上下文中调用，把 sessionStatus 改成 async 即可。
+async function sessionStatus(state: AgentState, tokenUsage?: TokenUsage): Promise<string> {
   const mcpSummary = mcpManager.getStatusSummary();
   const modelsLine = currentResolved.availableModels.length > 0
     ? `models   ${currentResolved.availableModels.join(", ")}`
     : "";
   const effectiveBaseURL = getEffectiveBaseURL(currentResolved, currentAuthState);
+  const leadUnread = await messageBus.unreadCount("lead");
   return [
     `workspace ${WORKDIR}`,
     `provider ${currentResolved.providerName}`,
@@ -667,7 +681,7 @@ function sessionStatus(state: AgentState, tokenUsage?: TokenUsage): string {
       ? `tokens   ${formatNum(tokenUsage.inputTokens)} in → ${formatNum(tokenUsage.outputTokens)} out  ${tokenUsage.cost.toFixed(4)}`
       : `tokens   ~${estimateTokens(state.chatHistory)} (estimated)`,
     `mcp      ${mcpSummary.connected} connected | ${mcpSummary.degraded} degraded | ${mcpSummary.disconnected} disconnected | ${mcpSummary.enabled} enabled`,
-    `team     ${teammateManager.listMembers().length} teammates | lead inbox: ${messageBus.inboxSize("lead")}`,
+    `team     ${teammateManager.listMembers().length} teammates | lead inbox: ${leadUnread}`,
     `uptime   ${formatDuration(Date.now() - state.launchedAt)}`,
   ].filter(Boolean).join("\n");
 }
@@ -836,9 +850,8 @@ function resolveStartupResumeState(): StartupResumeState {
   };
 }
 
-function buildLeadInboxQuery(inboxPrompt: string, userQuery: string): string {
-  return `${inboxPrompt}\n\n<user_request>\n${userQuery}\n</user_request>`;
-}
+// P1：buildLeadInboxQuery 已废弃。新的 runOneTurn helper（见组件内部）
+// 直接拼接 formatTeammateMessages + 用户 query，不再用 <user_request> 包裹。
 
 function findSlashCommandMatches(inputValue: string): SlashCommand[] {
   if (!inputValue.startsWith("/")) {
@@ -1067,6 +1080,9 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
   const messagesRef = useRef<UiMessage[]>([]);
   const [inputValue, setInputValue] = useState("");
   const [busy, setBusy] = useState(false);
+  // P1：busyRef 与 busy state 镜像，给 onSend("lead") listener 闭包用。
+  // 闭包读 state 会拿旧值，必须用 ref 读最新值。所有 setBusy 调用处同步更新此 ref。
+  const busyRef = useRef(false);
   const [trusted, setTrusted] = useState<boolean | null>(null);
   /**
    * Startup can begin with a fully resolved model when either:
@@ -1373,6 +1389,82 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
     }
   };
 
+  // P1 单轮运行入口：把未读 lead 消息 + 用户 query 合并注入，调用 runAgentTurn。
+  // 之所以拆成 helper：用户主动提交（带 query）和自动续轮（query 为空）共用同一段逻辑，避免重复。
+  // 命名为 runOneTurn 与 spec §3.5 对齐。
+  const runOneTurn = async (userQuery: string, signal: AbortSignal): Promise<void> => {
+    const unread = await messageBus.readUnread("lead");
+    let injected = "";
+    if (unread.length > 0) {
+      await messageBus.markRead("lead", unread);
+      pushMessage("system", `(injecting ${unread.length} teammate message(s))`, "inbox");
+      injected = formatTeammateMessages(unread);
+    }
+
+    const effectiveQuery = userQuery && injected
+      ? `${injected}\n\n${userQuery}`
+      : (userQuery || injected);
+
+    if (!effectiveQuery) return; // 双空：无事可做
+
+    await runAgentTurn(
+      agentConfig,
+      effectiveQuery,
+      agentStateRef.current,
+      bridge,
+      { signal },
+    );
+  };
+
+  // P1 lead idle 唤醒：listener 触发，但当前轮在跑就什么都不做（路径 A 的 while 兜底）。
+  // 只有 lead 当前空闲才主动开一轮。
+  const triggerLeadAutoTurn = async (): Promise<void> => {
+    if (busyRef.current) return;
+    if ((await messageBus.unreadCount("lead")) === 0) return;
+
+    setBusy(true); busyRef.current = true;
+    stopRequestedRef.current = false;
+    const abortController = new AbortController();
+    activeTurnAbortRef.current = abortController;
+
+    try {
+      await ensureMcpInitialized();
+      await refreshCurrentAuth();
+      await runOneTurn("", abortController.signal);
+      while (
+        !abortController.signal.aborted
+        && (await messageBus.unreadCount("lead")) > 0
+      ) {
+        pushMessage("system", "(continuing turn for teammate message(s))", "inbox");
+        await runOneTurn("", abortController.signal);
+      }
+    } catch (error) {
+      finalizeStreaming();
+      if (isTurnInterruptedError(error)) {
+        pushMessage("system", "Stopped current turn. Session context preserved.", "stop");
+      } else {
+        pushMessage("error", error instanceof Error ? error.message : String(error), "error");
+      }
+    } finally {
+      finalizeStreaming();
+      persistCurrentSession();
+      activeTurnAbortRef.current = null;
+      stopRequestedRef.current = false;
+      setBusy(false); busyRef.current = false;
+    }
+  };
+
+  // P1：注册 onSend("lead") listener。teammate / 工具调用 send(to=lead) 后，
+  // 写盘成功立刻触发此处回调；如果 lead 不在跑（busyRef=false）就主动开一轮。
+  // useEffect 空依赖：只在挂载时注册一次，卸载时 unregister。
+  useEffect(() => {
+    const unregister = messageBus.onSend("lead", () => {
+      void triggerLeadAutoTurn();
+    });
+    return unregister;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const submitQuery = async (query: string) => {
     const trimmed = query.trim();
     if (!trimmed || busy) {
@@ -1402,7 +1494,65 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
       if (command === "status") {
         await ensureMcpInitialized();
         await refreshCurrentAuth();
-        pushMessage("system", sessionStatus(agentStateRef.current, totalTokenUsage), "status");
+        pushMessage("system", await sessionStatus(agentStateRef.current, totalTokenUsage), "status");
+        return;
+      }
+
+      if (command === "usage") {
+        /**
+         * `/usage` 走的是 ChatGPT backend `/wham/usage`，所以前置条件是：
+         * 1. 当前 provider 必须是 openai；
+         * 2. 必须以 oauth 模式登录（API key 模式拿不到订阅维度的额度信息）。
+         *
+         * 为什么这里要先 refreshCurrentAuth：
+         * - 用户可能上次登录后过了好几天才用 /usage，access_token 大概率已经过期；
+         * - 这一步会用 refresh_token 主动续期，并把新的 token 写回 credentials 文件，
+         *   后面真正请求 /wham/usage 时就不会再收到 401。
+         */
+        if (currentResolved.providerName !== "openai") {
+          pushMessage(
+            "error",
+            `/usage 仅支持 openai provider，当前 provider 是 "${currentResolved.providerName}"。请先 /provider openai。`,
+            "usage",
+          );
+          return;
+        }
+
+        await refreshCurrentAuth();
+
+        const credentials = currentAuthState?.oauth;
+        if (currentAuthState?.authMode !== "oauth" || !credentials?.access_token) {
+          pushMessage(
+            "error",
+            "/usage 需要 openai oauth 登录，未检测到有效凭据。请先 /login openai。",
+            "usage",
+          );
+          return;
+        }
+
+        try {
+          const usage = await fetchOpenAIUsage(credentials);
+          pushMessage("system", formatUsageReport(usage), "usage");
+        } catch (error) {
+          if (error instanceof UsageRequestError) {
+            // status + body 一起带出来，方便用户区分是 token 过期（401）、账号未启用 codex（403）
+            // 还是 backend 临时故障（5xx）。body 截断到 200 字符避免刷屏。
+            const bodyPreview = error.body
+              ? ` body=${error.body.slice(0, 200)}${error.body.length > 200 ? "..." : ""}`
+              : "";
+            pushMessage(
+              "error",
+              `${error.message}${error.status ? ` (status=${error.status})` : ""}${bodyPreview}`,
+              "usage",
+            );
+          } else {
+            pushMessage(
+              "error",
+              `获取订阅用量失败：${error instanceof Error ? error.message : String(error)}`,
+              "usage",
+            );
+          }
+        }
         return;
       }
 
@@ -1444,12 +1594,51 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
       }
 
       if (command === "team") {
-        pushMessage("system", teammateManager.formatTeamStatus(), "team");
+        // P1：formatTeamStatus 已异步化（并发查询每个成员的未读数）。
+        pushMessage("system", await teammateManager.formatTeamStatus(), "team");
+        return;
+      }
+
+      if (command === "tasks") {
+        pushMessage("system", taskManager.list(), "tasks");
+        return;
+      }
+
+      if (command.startsWith("task")) {
+        const taskArg = command.slice(4).trim();
+        if (!taskArg) {
+          pushMessage("error", 'Usage: "/task <id>"', "task");
+          return;
+        }
+
+        const taskId = Number(taskArg);
+        if (!Number.isInteger(taskId) || taskId <= 0) {
+          pushMessage("error", `Invalid task id: "${taskArg}"`, "task");
+          return;
+        }
+
+        const task = taskManager.getTask(taskId);
+        if (!task) {
+          pushMessage("error", `Task not found: #${taskId}`, "task");
+          return;
+        }
+
+        // P1：删除 thread 事件展示。MessageBus.readThread 已废弃；
+        // P3 协议消息阶段会用独立机制（不再复用 mailbox）做事件审计。
+        pushMessage("system", taskManager.formatTask(taskId), "task");
         return;
       }
 
       if (command === "inbox") {
-        pushMessage("system", formatMailboxMessages(messageBus.drainInbox("lead")), "inbox");
+        // P1：/inbox 改为只读视图（含已读+未读全部历史），便于调试。
+        // 自动注入由 runOneTurn 在新一轮开始时处理，不再需要用户手动 drain。
+        const all = await messageBus.readAll("lead");
+        const formatted = all.length === 0
+          ? "(empty inbox)"
+          : all
+              .map((m) => `[${m.timestamp}] ${m.from} ${m.read ? "(read)" : "(UNREAD)"}\n${m.text}`)
+              .join("\n\n");
+        pushMessage("system", formatted, "inbox");
         return;
       }
 
@@ -1675,7 +1864,7 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
     if (trimmed.startsWith("/")) {
       if (skillSlashInvocation) {
         pushMessage("user", trimmed);
-        setBusy(true);
+        setBusy(true); busyRef.current = true;
         stopRequestedRef.current = false;
         const abortController = new AbortController();
         activeTurnAbortRef.current = abortController;
@@ -1705,7 +1894,7 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
           persistCurrentSession();
           activeTurnAbortRef.current = null;
           stopRequestedRef.current = false;
-          setBusy(false);
+          setBusy(false); busyRef.current = false;
         }
         return;
       }
@@ -1715,7 +1904,7 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
     }
 
     pushMessage("user", trimmed);
-    setBusy(true);
+    setBusy(true); busyRef.current = true;
     stopRequestedRef.current = false;
     const abortController = new AbortController();
     activeTurnAbortRef.current = abortController;
@@ -1724,16 +1913,19 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
       await ensureMcpInitialized();
       await refreshCurrentAuth();
 
-      const leadInbox = messageBus.drainInbox("lead");
-      if (leadInbox.length > 0) {
-        pushMessage("system", formatMailboxMessages(leadInbox), "inbox");
+      // P1：用户主动提交时合并未读邮件 + 用户 query 一起注入。
+      await runOneTurn(trimmed, abortController.signal);
+
+      // 严格 CC 自动续轮：邮箱有未读就持续开新轮，直到清空或被 abort。
+      // 为什么不加熔断：北哥要求严格对齐 CC，CC 自身也无熔断。
+      // 安全网仍在：用户随时可 Ctrl+C / Esc 触发 abortController。
+      while (
+        !abortController.signal.aborted
+        && (await messageBus.unreadCount("lead")) > 0
+      ) {
+        pushMessage("system", "(continuing turn for teammate message(s))", "inbox");
+        await runOneTurn("", abortController.signal);
       }
-
-      const effectiveQuery = leadInbox.length > 0
-        ? buildLeadInboxQuery(renderInboxPrompt(leadInbox), trimmed)
-        : trimmed;
-
-      await runAgentTurn(agentConfig, effectiveQuery, agentStateRef.current, bridge, { signal: abortController.signal });
     } catch (error) {
       finalizeStreaming();
       if (isTurnInterruptedError(error)) {
@@ -1749,7 +1941,7 @@ function CliApp({ startupResume }: { startupResume: StartupResumeState }) {
       persistCurrentSession();
       activeTurnAbortRef.current = null;
       stopRequestedRef.current = false;
-      setBusy(false);
+      setBusy(false); busyRef.current = false;
     }
   };
 

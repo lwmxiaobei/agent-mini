@@ -39,6 +39,7 @@ export function normalizeCommand(inputValue: string): string | null {
   switch (cmd) {
     case "help":
     case "status":
+    case "usage":
     case "mcp":
     case "team":
     case "inbox":

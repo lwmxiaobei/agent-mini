@@ -7,16 +7,26 @@ import {
   autoCompactResponseHistory,
   TOKEN_THRESHOLD,
 } from "./compact.js";
+import { isTransientNetworkError } from "./http.js";
 import { getDynamicMcpToolSurface } from "./mcp/runtime.js";
 import { messageBus, teammateManager, LEAD_NAME, TOOLS, CHAT_TOOLS, BASE_TOOLS, BASE_CHAT_TOOLS, TEAMMATE_TOOLS, TEAMMATE_CHAT_TOOLS, BASE_TOOL_HANDLERS, taskManager } from "./tools.js";
-import { renderInboxPrompt } from "./message-bus.js";
+import { formatTeammateMessages } from "./message-bus.js";
 import { getSubagentDefinition, type SubagentDefinition } from "./subagents.js";
 import type { TeammateRuntimeControl } from "./teammate-manager.js";
 import type { ToolArgs, ResponseInputItem, ChatMessage, AgentState, UiBridge, TokenUsage } from "./types.js";
 
+// P1：删除 MailboxEventType / MAILBOX_EVENT_TYPES / normalizeEventType。
+// 这些是 P3 协议消息字段，从 P1 阶段的 MailboxMessage 中已彻底移除。
+
 const NAG_THRESHOLD = 3;
 const NAG_MESSAGE = "<reminder>Update your tasks with task_list or task_update.</reminder>";
 const RESPONSES_COMPACT_INTERVAL = 20;
+const STREAM_MAX_RETRIES = 2;
+const STREAM_RETRY_DELAYS_MS = [200, 800] as const;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 type ToolHandler = (args: ToolArgs, control?: RunControl) => Promise<string> | string;
 type ToolHandlerMap = Record<string, ToolHandler>;
@@ -331,9 +341,8 @@ function isValidTeammateName(value: string): boolean {
   return /^[A-Za-z0-9_-]+$/.test(value);
 }
 
-function normalizeMessageType(value: unknown): "message" | "broadcast" {
-  return value === "broadcast" ? "broadcast" : "message";
-}
+// P1：删除 normalizeMessageType。message_send 不再支持 broadcast type；
+// P3 协议消息阶段会用独立工具（不混在 message_send schema 里）。
 
 function buildTeammateSystem(baseSystem: string, name: string, role: string): string {
   return `${baseSystem}
@@ -461,6 +470,10 @@ async function streamResponse(
   const normalizedInstructions = system.trim() || "You are a helpful coding assistant.";
   const normalizedInput = normalizeResponseInput(inputItems);
 
+  let attempt = 0;
+  // 仅 attempt 0 时为 false。一旦任何字节通过 bridge 推到 UI，就不能再重试，
+  // 否则用户会看到同一段文本被重复 append。
+  while (true) {
   const stream = client.responses.stream({
     model,
     instructions: normalizedInstructions,
@@ -476,8 +489,20 @@ async function streamResponse(
 
   let responseId: string | undefined;
   let assistantText = "";
+  let streamedToBridge = false;
   const streamedFunctionCalls = new Map<string, any>();
   const streamedAssistantContent = new Map<string, string>();
+
+  const emitAssistantDelta = (text: string) => {
+    if (!text) return;
+    streamedToBridge = true;
+    bridge.appendAssistantDelta(text);
+  };
+  const emitThinkingDelta = (text: string) => {
+    if (!text) return;
+    streamedToBridge = true;
+    bridge.appendThinkingDelta(text);
+  };
 
   /**
    * ChatGPT Codex stream responses are slightly different from the public
@@ -514,7 +539,7 @@ async function streamResponse(
           contentKey,
           `${streamedAssistantContent.get(contentKey) ?? ""}${delta}`,
         );
-        bridge.appendAssistantDelta(delta);
+        emitAssistantDelta(delta);
         continue;
       }
 
@@ -531,7 +556,7 @@ async function streamResponse(
 
         if (missingText) {
           assistantText += missingText;
-          bridge.appendAssistantDelta(missingText);
+          emitAssistantDelta(missingText);
         }
         streamedAssistantContent.set(contentKey, nextText);
         continue;
@@ -576,7 +601,7 @@ async function streamResponse(
 
         if (missingText) {
           assistantText += missingText;
-          bridge.appendAssistantDelta(missingText);
+          emitAssistantDelta(missingText);
         }
         streamedAssistantContent.set(contentKey, nextText);
         continue;
@@ -590,14 +615,14 @@ async function streamResponse(
 
         if (missingText) {
           assistantText += missingText;
-          bridge.appendAssistantDelta(missingText);
+          emitAssistantDelta(missingText);
         }
         streamedAssistantContent.set(contentKey, nextText);
         continue;
       }
 
       if (showThinking && ["response.reasoning_summary_text.delta", "response.reasoning_text.delta"].includes(event.type)) {
-        bridge.appendThinkingDelta(String(event.delta ?? ""));
+        emitThinkingDelta(String(event.delta ?? ""));
         continue;
       }
     }
@@ -617,7 +642,7 @@ async function streamResponse(
      * - 先补齐缺失尾巴，再 finalize，才能最大程度保留“同一条回答”的连续性。
      */
     if (missingAssistantText) {
-      bridge.appendAssistantDelta(missingAssistantText);
+      emitAssistantDelta(missingAssistantText);
       assistantText = `${assistantText}${missingAssistantText}`;
     }
     bridge.finalizeStreaming();
@@ -661,7 +686,18 @@ async function streamResponse(
         partialAssistantText: assistantText || undefined,
       });
     }
+    // 仅当 transient 网络错误且 UI 还没收到任何内容时才重试，避免重复输出。
+    if (
+      attempt < STREAM_MAX_RETRIES &&
+      !streamedToBridge &&
+      isTransientNetworkError(error)
+    ) {
+      await sleep(STREAM_RETRY_DELAYS_MS[attempt] ?? STREAM_RETRY_DELAYS_MS[STREAM_RETRY_DELAYS_MS.length - 1]);
+      attempt += 1;
+      continue;
+    }
     throw error;
+  }
   }
 }
 
@@ -689,69 +725,101 @@ async function streamChatCompletion(
   if (showThinking) {
     createParams.thinking = { type: "enabled" };
   }
-  const stream = await client.chat.completions.create(
-    createParams as any,
-    control?.signal ? { signal: control.signal } : undefined,
-  ) as any;
 
-  let content = "";
-  let reasoningContent = "";
-  const toolCallBuffers: Record<number, { id: string; type: "function"; function: { name: string; arguments: string } }> = {};
+  let attempt = 0;
+  while (true) {
+    let content = "";
+    let reasoningContent = "";
+    let streamedToBridge = false;
+    const toolCallBuffers: Record<number, { id: string; type: "function"; function: { name: string; arguments: string } }> = {};
 
-  try {
-    for await (const chunk of stream) {
-      if (chunk.usage) {
-        onUsage?.(extractTokenUsage(chunk.usage));
+    let stream: any;
+    try {
+      stream = await client.chat.completions.create(
+        createParams as any,
+        control?.signal ? { signal: control.signal } : undefined,
+      ) as any;
+    } catch (error) {
+      if (error instanceof APIUserAbortError || control?.signal?.aborted) {
+        throw new TurnInterruptedError({});
       }
-      const delta = chunk.choices?.[0]?.delta as any;
-      if (!delta) continue;
-
-      if (showThinking && delta.reasoning_content) {
-        reasoningContent += delta.reasoning_content;
-        bridge.appendThinkingDelta(delta.reasoning_content);
+      if (
+        attempt < STREAM_MAX_RETRIES &&
+        isTransientNetworkError(error)
+      ) {
+        await sleep(STREAM_RETRY_DELAYS_MS[attempt] ?? STREAM_RETRY_DELAYS_MS[STREAM_RETRY_DELAYS_MS.length - 1]);
+        attempt += 1;
+        continue;
       }
+      throw error;
+    }
 
-      if (delta.content) {
-        content += delta.content;
-        bridge.appendAssistantDelta(delta.content);
-      }
+    try {
+      for await (const chunk of stream) {
+        if (chunk.usage) {
+          onUsage?.(extractTokenUsage(chunk.usage));
+        }
+        const delta = chunk.choices?.[0]?.delta as any;
+        if (!delta) continue;
 
-      if (delta.tool_calls) {
-        for (const tc of delta.tool_calls) {
-          if (!toolCallBuffers[tc.index]) {
-            toolCallBuffers[tc.index] = {
-              id: tc.id ?? "",
-              type: "function" as const,
-              function: { name: "", arguments: "" },
-            };
+        if (showThinking && delta.reasoning_content) {
+          reasoningContent += delta.reasoning_content;
+          streamedToBridge = true;
+          bridge.appendThinkingDelta(delta.reasoning_content);
+        }
+
+        if (delta.content) {
+          content += delta.content;
+          streamedToBridge = true;
+          bridge.appendAssistantDelta(delta.content);
+        }
+
+        if (delta.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            if (!toolCallBuffers[tc.index]) {
+              toolCallBuffers[tc.index] = {
+                id: tc.id ?? "",
+                type: "function" as const,
+                function: { name: "", arguments: "" },
+              };
+            }
+            const buf = toolCallBuffers[tc.index];
+            if (tc.id) buf.id = tc.id;
+            if (tc.function?.name) buf.function.name += tc.function.name;
+            if (tc.function?.arguments) buf.function.arguments += tc.function.arguments;
           }
-          const buf = toolCallBuffers[tc.index];
-          if (tc.id) buf.id = tc.id;
-          if (tc.function?.name) buf.function.name += tc.function.name;
-          if (tc.function?.arguments) buf.function.arguments += tc.function.arguments;
         }
       }
+
+      bridge.finalizeStreaming();
+
+      const toolCalls = Object.keys(toolCallBuffers)
+        .sort((left, right) => Number(left) - Number(right))
+        .map((key) => toolCallBuffers[Number(key)]);
+
+      return {
+        content: content || null,
+        tool_calls: toolCalls.length > 0 ? toolCalls : [],
+        reasoning_content: reasoningContent || undefined,
+      };
+    } catch (error) {
+      bridge.finalizeStreaming();
+      if (error instanceof APIUserAbortError || control?.signal?.aborted) {
+        throw new TurnInterruptedError({
+          partialAssistantText: content || undefined,
+        });
+      }
+      if (
+        attempt < STREAM_MAX_RETRIES &&
+        !streamedToBridge &&
+        isTransientNetworkError(error)
+      ) {
+        await sleep(STREAM_RETRY_DELAYS_MS[attempt] ?? STREAM_RETRY_DELAYS_MS[STREAM_RETRY_DELAYS_MS.length - 1]);
+        attempt += 1;
+        continue;
+      }
+      throw error;
     }
-
-    bridge.finalizeStreaming();
-
-    const toolCalls = Object.keys(toolCallBuffers)
-      .sort((left, right) => Number(left) - Number(right))
-      .map((key) => toolCallBuffers[Number(key)]);
-
-    return {
-      content: content || null,
-      tool_calls: toolCalls.length > 0 ? toolCalls : [],
-      reasoning_content: reasoningContent || undefined,
-    };
-  } catch (error) {
-    bridge.finalizeStreaming();
-    if (error instanceof APIUserAbortError || control?.signal?.aborted) {
-      throw new TurnInterruptedError({
-        partialAssistantText: content || undefined,
-      });
-    }
-    throw error;
   }
 }
 
@@ -776,7 +844,14 @@ async function runToolCall(
   };
 }
 
-async function sendTeamMessage(from: string, to: string, content: string, type: "message" | "broadcast"): Promise<string> {
+// P1 简化版：只支持 from/to/content。
+// 广播 / 协议字段（type/eventType/taskId/threadId/payload）全部移除：broadcast 由 P3 重做，
+// 其余字段属于协议消息范畴，P3 用独立 schema 实现。
+async function sendTeamMessage(
+  from: string,
+  to: string,
+  content: string,
+): Promise<string> {
   const recipient = to.trim();
   const body = content.trim();
   if (!recipient) {
@@ -786,55 +861,33 @@ async function sendTeamMessage(from: string, to: string, content: string, type: 
     return "Error: Missing content.";
   }
 
-  let recipients: string[];
-  if (type === "broadcast" && recipient === "all") {
-    recipients = [LEAD_NAME, ...teammateManager.listMembers().map((member) => member.name)]
-      .filter((name, index, all) => name !== from && all.indexOf(name) === index);
-  } else {
-    recipients = [recipient];
-  }
-
-  if (recipients.length === 0) {
-    return "Error: No recipients available.";
-  }
-
-  for (const name of recipients) {
-    if (name === LEAD_NAME) {
-      continue;
-    }
-
-    const member = teammateManager.getMember(name);
+  // 校验收件人：lead 总是合法；teammate 必须存在且在运行。
+  if (recipient !== LEAD_NAME) {
+    const member = teammateManager.getMember(recipient);
     if (!member) {
-      return `Error: Unknown teammate: ${name}`;
+      return `Error: Unknown teammate: ${recipient}`;
     }
-    if (!teammateManager.isRunning(name)) {
-      return `Error: Teammate ${name} is not running. Spawn or restart it first.`;
-    }
-  }
-
-  for (const name of recipients) {
-    messageBus.send({
-      from,
-      to: name,
-      content: body,
-      type: type === "broadcast" ? "broadcast" : "message",
-    });
-    if (name !== LEAD_NAME) {
-      teammateManager.wake(name);
+    if (!teammateManager.isRunning(recipient)) {
+      return `Error: Teammate ${recipient} is not running. Spawn or restart it first.`;
     }
   }
 
-  return `Sent ${type} to ${recipients.join(", ")}`;
+  await messageBus.send({ from, to: recipient, content: body });
+
+  // 给 teammate 发消息时主动 wake 一下，让 idle 队友立刻处理；
+  // 给 lead 的消息由 MessageBus.onSend("lead") 在 UI 层触发自动续轮，此处不耦合。
+  if (recipient !== LEAD_NAME) {
+    teammateManager.wake(recipient);
+  }
+
+  return `Sent message to ${recipient}`;
 }
 
 function buildSharedTeamHandlers(agentName: string): Pick<ToolHandlerMap, "message_send"> {
   return {
-    message_send: async ({ to, content, type }) => sendTeamMessage(
-      agentName,
-      String(to ?? ""),
-      String(content ?? ""),
-      normalizeMessageType(type),
-    ),
+    // P1：消息工具只支持 to + content。扩展字段（type/eventType/taskId 等）随 P3 协议消息重做。
+    message_send: async ({ to, content }) =>
+      sendTeamMessage(agentName, String(to ?? ""), String(content ?? "")),
   };
 }
 
@@ -842,18 +895,28 @@ async function launchTeammateRuntime(config: AgentConfig, control: TeammateRunti
   const bridge = createSilentBridge();
 
   while (true) {
-    if (!teammateManager.shouldStop(control) && messageBus.inboxSize(control.name) === 0) {
+    // 没未读消息则进 idle，等待 wake（teammateManager.wake 由 sendTeamMessage 主动调用）。
+    if (!teammateManager.shouldStop(control) && (await messageBus.unreadCount(control.name)) === 0) {
       teammateManager.markIdle(control.name);
       await teammateManager.waitForWake(control);
     }
 
-    const inbox = messageBus.drainInbox(control.name);
-    const shutdownRequested = inbox.some((message) => message.type === "shutdown_request");
-    const actionableMessages = inbox.filter((message) => message.type !== "shutdown_request");
+    // P1：用 readUnread + markRead 替代 drainInbox。文件保留全部历史，
+    // 重启后未处理的 unread 消息仍然可见，便于审计与可恢复性。
+    // shutdown_request 协议消息从 P1 阶段的 MailboxMessage 中已移除，本轮不再过滤；
+    // P3 阶段重做协议时会用独立机制（不再混在 mailbox）。
+    const inbox = await messageBus.readUnread(control.name);
+    if (inbox.length > 0) {
+      await messageBus.markRead(control.name, inbox);
+    }
+    // P1：保持 shutdown 路径在外层（teammateManager.requestStop / shouldStop），
+    // 此处不再检测「邮件中是否含 shutdown_request」。
+    const shutdownRequested = false;
+    const actionableMessages = inbox;
 
     if (actionableMessages.length > 0) {
       teammateManager.markWorking(control.name);
-      const prompt = `${renderInboxPrompt(actionableMessages)}\n\n${buildInboxWorkPrompt()}`;
+      const prompt = `${formatTeammateMessages(actionableMessages)}\n\n${buildInboxWorkPrompt()}`;
       const runtime = await prepareToolRuntime(
         buildTeammateHandlers(control.name),
         TEAMMATE_TOOLS,
@@ -871,10 +934,12 @@ async function launchTeammateRuntime(config: AgentConfig, control: TeammateRunti
     }
 
     if (shutdownRequested || teammateManager.shouldStop(control)) {
-      messageBus.send({
+      // P1：删除 shutdown_response 协议邮件。lead 通过 teammate_list 看 status=stopped
+      // 即可感知；P3 协议消息阶段会用独立 schema 重做这个回执。
+      // 仍然给 lead 发一条人类可读的简短通知，便于 UI 显示队友已退出。
+      await messageBus.send({
         from: control.name,
         to: LEAD_NAME,
-        type: "shutdown_response",
         content: `Teammate ${control.name} has shut down.`,
       });
       teammateManager.markStopped(control.name);
@@ -939,10 +1004,11 @@ function buildLeadHandlers(config: AgentConfig, bridge: UiBridge): ToolHandlerMa
         return `Error: Teammate ${teammateName} is already running.`;
       }
 
-      messageBus.send({
+      // P1：teammate_spawn 后向新队友邮箱投递初始 prompt。
+      // 简化为 from/to/content；新 send API 是 async，必须 await。
+      await messageBus.send({
         from: LEAD_NAME,
         to: teammateName,
-        type: "message",
         content: initialPrompt,
       });
       teammateManager.wake(teammateName);
@@ -971,10 +1037,13 @@ function buildLeadHandlers(config: AgentConfig, bridge: UiBridge): ToolHandlerMa
             return `- ${teammateName}: already stopped`;
           }
 
-          messageBus.send({
+          // P1：删除 shutdown_request 协议邮件。优雅退出由 teammateManager.requestStop
+          // 在控制平面（control.stopRequested）实现，不再依赖邮箱传协议字段。
+          // 同时给目标队友发一条人类可读的退出通知，让队友 loop 在处理完最后一条邮件后
+          // 通过 shouldStop 检测到主动退出意图（注：本通知是普通消息，不是协议）。
+          void messageBus.send({
             from: LEAD_NAME,
             to: teammateName,
-            type: "shutdown_request",
             content: "Graceful shutdown requested by lead.",
           });
           teammateManager.requestStop(teammateName);

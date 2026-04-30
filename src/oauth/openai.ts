@@ -1,8 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
-import { EnvHttpProxyAgent, type Dispatcher } from "undici";
+import { type Dispatcher } from "undici";
 
 import type { StoredOAuthCredentials } from "../config.js";
+import { getProxyOnlyDispatcher, getStreamingDispatcher } from "../http.js";
 
 export const OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export const OPENAI_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize";
@@ -156,56 +157,19 @@ export type StartOpenAILoginResult = {
   credentials: StoredOAuthCredentials;
 };
 
-let oauthProxyDispatcher: Dispatcher | null = null;
 type OAuthFetchInit = RequestInit & { dispatcher?: Dispatcher };
 type OpenAIOAuthFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 /**
- * Detect whether the current process has proxy environment variables that
- * should be applied to outbound OAuth HTTP requests.
+ * Token exchange / model list 这类一次性 OAuth 请求保留原行为：
+ * - 无代理时不附 dispatcher，由 Node 默认 fetch 接管；
+ * - 有代理时统一走 EnvHttpProxyAgent。
  *
- * Why this exists:
- * - Node's built-in `fetch` behavior around shell proxy variables is not
- *   consistent enough for this CLI's OAuth flow.
- * - The user already configures proxies in their shell environment, so the CLI
- *   should honor those settings explicitly instead of hoping the runtime does.
- * - Returning a boolean keeps the call site simple and avoids constructing a
- *   proxy dispatcher when there is nothing to route through.
- */
-function hasProxyEnvironment(): boolean {
-  return [
-    process.env.HTTPS_PROXY,
-    process.env.https_proxy,
-    process.env.HTTP_PROXY,
-    process.env.http_proxy,
-    process.env.ALL_PROXY,
-    process.env.all_proxy,
-  ].some((value) => Boolean(value?.trim()));
-}
-
-/**
- * Create a shared dispatcher that makes OAuth HTTP requests follow the same
- * proxy environment variables as the user's shell.
- *
- * Why this exists:
- * - `/oauth/token` is the first request in this flow that is performed by the
- *   local Node process instead of the browser, so it must opt into proxy usage
- *   explicitly.
- * - `EnvHttpProxyAgent` understands the conventional proxy variables and `NO_PROXY`,
- *   which is the least surprising behavior for a CLI running from a terminal.
- * - The dispatcher is cached so repeated refresh-token calls do not recreate
- *   connection pools unnecessarily.
+ * 共享 dispatcher 仅用于真正长时间的流式推理（见 createOpenAIOAuthFetch），
+ * 那里需要 short keep-alive 防止下一轮 stream 拿到已死的连接立刻报 `terminated`。
  */
 function getOAuthDispatcher(): Dispatcher | undefined {
-  if (!hasProxyEnvironment()) {
-    return undefined;
-  }
-
-  if (!oauthProxyDispatcher) {
-    oauthProxyDispatcher = new EnvHttpProxyAgent();
-  }
-
-  return oauthProxyDispatcher;
+  return getProxyOnlyDispatcher();
 }
 
 /**
@@ -224,7 +188,9 @@ export function createOpenAIOAuthFetch(): OpenAIOAuthFetch {
   return async (input: RequestInfo | URL, init?: RequestInit) => {
     const requestInit: OAuthFetchInit = {
       ...init,
-      dispatcher: getOAuthDispatcher(),
+      // 推理流式请求需要 short keep-alive，避免在多轮工具执行之后下一轮 stream
+      // 复用了一条已被远端关闭的连接、立刻报 undici `terminated`。
+      dispatcher: getStreamingDispatcher(),
     };
     return await fetch(input, requestInit);
   };

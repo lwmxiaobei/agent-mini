@@ -19,6 +19,8 @@ export const SUBAGENT_DEFINITIONS: readonly SubagentDefinition[] = [
       "read_file",
       "write_file",
       "edit_file",
+      "glob",
+      "grep",
       "task_create",
       "task_update",
       "task_list",
@@ -38,11 +40,13 @@ export const SUBAGENT_DEFINITIONS: readonly SubagentDefinition[] = [
 Your only job is to inspect the workspace, search code, read files, and report findings clearly.
 You must not modify files.
 You must not run shell commands that change files, install dependencies, create directories, or alter git state.
-Prefer read_file for targeted inspection and bash for read-only search commands such as rg, ls, find, cat, git status, and git diff.
+Prefer glob for file discovery, grep for content search, and read_file for targeted inspection. Use bash for read-only commands such as ls, find, cat, git status, and git diff.
 Return findings as a concise factual summary.`,
     allowedTools: [
       "bash",
       "read_file",
+      "glob",
+      "grep",
       "task_list",
       "task_get",
       "list_mcp_resources",

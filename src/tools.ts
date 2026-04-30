@@ -4,7 +4,7 @@ import os from "node:os";
 import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-import { MessageBus, formatMailboxMessages } from "./message-bus.js";
+import { MessageBus } from "./message-bus.js";
 import { TeammateManager } from "./teammate-manager.js";
 import { TaskManager } from "./task-manager.js";
 import { SkillLoader } from "./skills/index.js";
@@ -720,6 +720,8 @@ export const BASE_TOOLS = [
       properties: {
         subject: { type: "string", description: "Short title of the task" },
         description: { type: "string", description: "Detailed description (optional)" },
+        owner: { type: "string", description: "Task creator or owner. Defaults to lead." },
+        assignee: { type: "string", description: "Optional teammate assigned to this task." },
       },
       required: ["subject"],
       additionalProperties: false,
@@ -729,12 +731,12 @@ export const BASE_TOOLS = [
     type: "function",
     name: "task_update",
     description:
-      "Update a task's status or dependencies. When a task is marked completed, all tasks blocked by it are automatically unblocked.",
+      "Update a task's status, assignment, summary, blocked reason, or dependencies. When a task is marked completed, all tasks blocked by it are automatically unblocked.",
     parameters: {
       type: "object",
       properties: {
         task_id: { type: "integer", description: "ID of the task to update" },
-        status: { type: "string", enum: ["pending", "in_progress", "completed"] },
+        status: { type: "string", enum: ["pending", "assigned", "in_progress", "blocked", "completed", "failed"] },
         blocked_by: {
           type: "array",
           items: { type: "integer" },
@@ -745,8 +747,67 @@ export const BASE_TOOLS = [
           items: { type: "integer" },
           description: "Task IDs that depend on this task (add to existing)",
         },
+        assignee: { type: "string", description: "Teammate assigned to this task." },
+        result_summary: { type: "string", description: "Summary of the task result." },
+        blocked_reason: { type: "string", description: "Reason the task is blocked." },
       },
       required: ["task_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "task_assign",
+    description: "Assign a task to a teammate, notify them, and wake their runtime.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { type: "integer", description: "ID of the task to assign" },
+        assignee: { type: "string", description: "Teammate assigned to this task." },
+      },
+      required: ["task_id", "assignee"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "task_complete",
+    description: "Mark a task completed with a result summary and emit a structured completion event.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { type: "integer", description: "ID of the task to complete" },
+        result_summary: { type: "string", description: "Summary of the completed task result." },
+      },
+      required: ["task_id", "result_summary"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "task_block",
+    description: "Mark a task blocked with a reason and emit a structured blocked event.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { type: "integer", description: "ID of the blocked task" },
+        reason: { type: "string", description: "Reason the task is blocked." },
+      },
+      required: ["task_id", "reason"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "task_fail",
+    description: "Mark a task failed and emit a structured failure event.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: { type: "integer", description: "ID of the failed task" },
+        reason: { type: "string", description: "Reason the task failed." },
+      },
+      required: ["task_id", "reason"],
       additionalProperties: false,
     },
   },
@@ -862,7 +923,8 @@ ${describeSubagentsForHumans()}`,
   },
 } as const;
 
-// 团队协作相关工具单独拆开定义，便于控制哪些角色能看到哪些能力。
+// 团队协作消息工具。P1 阶段只保留最小字段：to + content。
+// 协议消息（shutdown / approval）将在 P3 用独立工具实现，不再混在 message_send 里。
 export const TEAM_MESSAGE_TOOL = {
   type: "function",
   name: "message_send",
@@ -870,9 +932,8 @@ export const TEAM_MESSAGE_TOOL = {
   parameters: {
     type: "object",
     properties: {
-      to: { type: "string", description: "Target teammate name, lead, or all when broadcasting" },
+      to: { type: "string", description: "Target teammate name or 'lead'" },
       content: { type: "string", description: "Message body" },
-      type: { type: "string", enum: ["message", "broadcast"] },
     },
     required: ["to", "content"],
     additionalProperties: false,
@@ -919,20 +980,8 @@ export const TEAMMATE_SHUTDOWN_TOOL = {
   },
 } as const;
 
-export const LEAD_INBOX_TOOL = {
-  type: "function",
-  name: "lead_inbox",
-  description: "Read the lead inbox. Set drain=true to clear after reading.",
-  parameters: {
-    type: "object",
-    properties: {
-      drain: { type: "boolean" },
-    },
-    additionalProperties: false,
-  },
-} as const;
-
 // 主 agent 可以看到全部工具：基础工具 + 子任务 + 团队协作。
+// P1 删除 LEAD_INBOX_TOOL：lead 邮箱由 runOneTurn 自动注入，不再需要 lead 主动「查邮箱」。
 export const TOOLS = [
   ...BASE_TOOLS,
   TASK_TOOL,
@@ -940,7 +989,6 @@ export const TOOLS = [
   TEAMMATE_SPAWN_TOOL,
   TEAMMATE_LIST_TOOL,
   TEAMMATE_SHUTDOWN_TOOL,
-  LEAD_INBOX_TOOL,
 ] as const;
 
 // teammate 只能使用基础工具和消息发送，避免无限扩张权限。
@@ -977,17 +1025,82 @@ export const BASE_TOOL_HANDLERS: Record<string, (args: ToolArgs, control?: { sig
   list_mcp_resources: (args) => handleListMcpResources(args),
   read_mcp_resource: (args) => handleReadMcpResource(args),
   mcp_call: (args) => handleMcpCall(args),
-  task_create: ({ subject, description }) => taskManager.create(String(subject), toOptionalString(description)),
-  task_update: ({ task_id, status, blocked_by, blocks }) =>
+  task_create: ({ subject, description, owner, assignee }) =>
+    taskManager.create(
+      String(subject),
+      toOptionalString(description),
+      toOptionalString(owner) ?? LEAD_NAME,
+      toOptionalString(assignee),
+    ),
+  task_update: ({ task_id, status, blocked_by, blocks, assignee, result_summary, blocked_reason }) =>
     taskManager.update(
       Number(task_id),
       toOptionalString(status),
       blocked_by as number[] | undefined,
       blocks as number[] | undefined,
+      toOptionalString(assignee),
+      toOptionalString(result_summary),
+      toOptionalString(blocked_reason),
     ),
+  task_assign: ({ task_id, assignee }) => {
+    const task = taskManager.getTask(Number(task_id));
+    if (!task) {
+      return `Error: Task ${Number(task_id)} not found.`;
+    }
+
+    const normalizedAssignee = String(assignee ?? "").trim();
+    if (!normalizedAssignee) {
+      return "Error: assignee is required.";
+    }
+
+    const updated = taskManager.update(task.id, "assigned", undefined, undefined, normalizedAssignee);
+    // P1：保留「lead 把任务通知到 assignee」的真实消息，简化为只 from/to/content。
+    // 任务详情拼到 content 里方便 assignee 直接看到，不再依赖 payload 字段。
+    // task_started 回执在此处删除（属于协议事件，P3 用独立 schema 重做）。
+    void messageBus.send({
+      from: LEAD_NAME,
+      to: normalizedAssignee,
+      content: `Assigned task #${task.id}: ${task.subject}\n${task.description}`,
+    });
+    teammateManager.wake(normalizedAssignee);
+    return updated;
+  },
+  task_complete: ({ task_id, result_summary }) => {
+    const task = taskManager.getTask(Number(task_id));
+    if (!task) {
+      return `Error: Task ${Number(task_id)} not found.`;
+    }
+
+    // P1 阶段不再向 lead 发协议消息（task_completed）。task manager 的状态变更
+    // 是 lead 通过 task_list/task_get 自查的依据；P3 协议消息阶段会用独立 schema 重做。
+    const updated = taskManager.update(task.id, "completed", undefined, undefined, undefined, String(result_summary ?? ""));
+    return updated;
+  },
+  task_block: ({ task_id, reason }) => {
+    const task = taskManager.getTask(Number(task_id));
+    if (!task) {
+      return `Error: Task ${Number(task_id)} not found.`;
+    }
+
+    // P1：同 task_complete，删除 messageBus.send；仅写入 task manager 状态。
+    const text = String(reason ?? "");
+    const updated = taskManager.update(task.id, "blocked", undefined, undefined, undefined, undefined, text);
+    return updated;
+  },
+  task_fail: ({ task_id, reason }) => {
+    const task = taskManager.getTask(Number(task_id));
+    if (!task) {
+      return `Error: Task ${Number(task_id)} not found.`;
+    }
+
+    // P1：同 task_complete，删除 messageBus.send；仅写入 task manager 状态。
+    const text = String(reason ?? "");
+    const updated = taskManager.update(task.id, "failed", undefined, undefined, undefined, text);
+    return updated;
+  },
   task_list: () => taskManager.list(),
   task_get: ({ task_id }) => taskManager.get(Number(task_id)),
   load_skill: ({ name, args }) => skillLoader.renderSkill(String(name), toOptionalString(args)),
-  teammate_list: () => teammateManager.formatTeamStatus(),
-  lead_inbox: ({ drain }) => formatMailboxMessages(drain ? messageBus.drainInbox(LEAD_NAME) : messageBus.readInbox(LEAD_NAME)),
+  // P1：teammate_list handler 异步化。formatTeamStatus 在 T6 改成 async。
+  teammate_list: async () => await teammateManager.formatTeamStatus(),
 };

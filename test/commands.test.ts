@@ -15,6 +15,13 @@ test("normalizeCommand still aliases quit to exit", () => {
   assert.equal(normalizeCommand("/quit"), "exit");
 });
 
+test("normalizeCommand recognizes /usage as a built-in command", () => {
+  assert.equal(normalizeCommand("/usage"), "usage");
+  assert.equal(normalizeCommand("/USAGE"), "usage");
+  // 没有 "/" 前缀的纯文本不应该被吞成命令，避免误吞普通对话
+  assert.equal(normalizeCommand("usage"), null);
+});
+
 test("normalizeCommand returns null for unknown slash commands", () => {
   assert.equal(normalizeCommand("/does-not-exist"), null);
 });

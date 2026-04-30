@@ -42,7 +42,7 @@ export class TeammateManager {
 
   private defaultConfig(): TeamConfig {
     return {
-      version: 1,
+      version: 2,
       leadName: this.leadName,
       members: [],
     };
@@ -62,7 +62,7 @@ export class TeammateManager {
       const content = fs.readFileSync(this.configPath, "utf8");
       const parsed = JSON.parse(content) as Partial<TeamConfig>;
       return {
-        version: 1,
+        version: 2,
         leadName: this.leadName,
         members: Array.isArray(parsed.members) ? sortMembers(parsed.members as TeammateRecord[]) : [],
       };
@@ -73,7 +73,7 @@ export class TeammateManager {
 
   private saveConfig(config: TeamConfig): void {
     const normalized: TeamConfig = {
-      version: 1,
+      version: 2,
       leadName: this.leadName,
       members: sortMembers(config.members),
     };
@@ -87,6 +87,8 @@ export class TeammateManager {
     for (const member of config.members) {
       if (member.status !== "stopped") {
         member.status = "stopped";
+        member.currentTaskId = undefined;
+        member.currentThreadId = undefined;
         changed = true;
       }
     }
@@ -164,11 +166,39 @@ export class TeammateManager {
       member.lastError = undefined;
     }
 
+    if (status === "idle" || status === "stopped") {
+      member.currentTaskId = undefined;
+      member.currentThreadId = undefined;
+    }
+
+    this.saveConfig(config);
+  }
+
+  setCurrentWork(name: string, taskId?: number, threadId?: string, summary?: string): void {
+    const config = this.loadConfig();
+    const member = config.members.find((entry) => entry.name === name);
+    if (!member) {
+      return;
+    }
+
+    member.lastActiveAt = new Date().toISOString();
+    member.currentTaskId = taskId;
+    member.currentThreadId = threadId;
+    if (typeof summary === "string") {
+      member.lastSummary = summary;
+    }
     this.saveConfig(config);
   }
 
   markWorking(name: string): void {
     this.setStatus(name, "working");
+  }
+
+  markBlocked(name: string, summary?: string): void {
+    this.setStatus(name, "blocked");
+    if (summary) {
+      this.setCurrentWork(name, this.getMember(name)?.currentTaskId, this.getMember(name)?.currentThreadId, summary);
+    }
   }
 
   markIdle(name: string): void {
@@ -198,6 +228,7 @@ export class TeammateManager {
       role,
       stopRequested: false,
       waiters: new Set(),
+      running: undefined,
       state: this.createRuntimeState(name, role),
     };
     this.runtimeControls.set(name, control);
@@ -207,10 +238,12 @@ export class TeammateManager {
       .catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
         this.markError(name, message);
-        this.messageBus.send({
+        // P1：删除 task_failed 协议字段（eventType/taskId/threadId），仅给 lead 邮箱
+        // 写入人类可读的失败通知。任务级失败状态依然通过 task manager 体现。
+        // void：runner 失败本身已由 markError 记录，这里 send 失败也只是丢条通知，不阻断。
+        void this.messageBus.send({
           from: name,
           to: this.leadName,
-          type: "message",
           content: `Teammate ${name} failed: ${message}`,
         });
       })
@@ -240,7 +273,8 @@ export class TeammateManager {
   }
 
   async waitForWake(control: TeammateRuntimeControl): Promise<void> {
-    if (control.stopRequested || this.messageBus.inboxSize(control.name) > 0) {
+    // 进入等待前先看一眼未读数：若有未读消息则不应该睡，立刻返回让上层 drain。
+    if (control.stopRequested || (await this.messageBus.unreadCount(control.name)) > 0) {
       return;
     }
 
@@ -265,19 +299,25 @@ export class TeammateManager {
     return control.stopRequested;
   }
 
-  formatTeamStatus(): string {
+  // P1：异步化。inboxSize 同步 API 已废弃，改为 await unreadCount。
+  // 用 Promise.all 并发查询所有成员未读数，避免 N 次串行 fs 读放大延迟。
+  async formatTeamStatus(): Promise<string> {
     const members = this.listMembers();
     if (members.length === 0) {
       return `team_dir ${this.teamDir}\n(no teammates)`;
     }
 
-    return [
-      `team_dir ${this.teamDir}`,
-      ...members.map((member) => {
-        const inboxSize = this.messageBus.inboxSize(member.name);
+    const lines = await Promise.all(
+      members.map(async (member) => {
+        const inboxSize = await this.messageBus.unreadCount(member.name);
         const errorSuffix = member.lastError ? ` error=${member.lastError}` : "";
-        return `- ${member.name} [${member.status}] role=${member.role} inbox=${inboxSize} last_active=${member.lastActiveAt}${errorSuffix}`;
+        const workSuffix = member.currentTaskId ? ` task=${member.currentTaskId}` : "";
+        const threadSuffix = member.currentThreadId ? ` thread=${member.currentThreadId}` : "";
+        const summarySuffix = member.lastSummary ? ` summary=${member.lastSummary}` : "";
+        return `- ${member.name} [${member.status}] role=${member.role} inbox=${inboxSize} last_active=${member.lastActiveAt}${workSuffix}${threadSuffix}${summarySuffix}${errorSuffix}`;
       }),
-    ].join("\n");
+    );
+
+    return [`team_dir ${this.teamDir}`, ...lines].join("\n");
   }
 }
